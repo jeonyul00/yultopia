@@ -1,0 +1,31 @@
+{
+  "name": "yultopia",
+  "owner": {
+    "name": "jeonyul00",
+    "url": "https://github.com/jeonyul00"
+  },
+  "metadata": {
+    "description": "율토피아 Claude Code 플러그인 마켓플레이스"
+  },
+  "plugins": [
+    {
+      "name": "yultopia",
+      "source": "./plugins/yultopia",
+      "description": "한국어 코드리뷰·버그조사·인수인계·문서동기화 스킬 묶음. Codex 자동 검수 연동(선택).",
+      "version": "1.0.0",
+      "author": {
+        "name": "jeonyul00",
+        "url": "https://github.com/jeonyul00"
+      },
+      "category": "code-quality",
+      "tags": [
+        "korean",
+        "code-review",
+        "debugging",
+        "handoff",
+        "documentation",
+        "codex"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "yultopia",
+  "description": "율토피아 작업 규칙 묶음 — 코드리뷰/버그조사/인수인계/문서동기화 스킬과 Codex 자동 검수",
+  "version": "1.0.0",
+  "author": {
+    "name": "jeonyul00",
+    "url": "https://github.com/jeonyul00"
+  },
+  "homepage": "https://github.com/jeonyul00/yultopia",
+  "repository": "https://github.com/jeonyul00/yultopia",
+  "license": "MIT",
+  "keywords": [
+    "korean",
+    "code-review",
+    "debugging",
+    "handoff",
+    "documentation",
+    "codex"
+  ]
+}

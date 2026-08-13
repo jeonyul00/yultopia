@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "block"]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "file", "line", "why", "fix"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["P1", "P2", "P3"] },
+          "file": { "type": "string" },
+          "line": { "type": "string" },
+          "why": { "type": "string" },
+          "fix": { "type": "string" }
+        }
+      }
+    }
+  }
+}
