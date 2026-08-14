@@ -8,7 +8,7 @@ argument-hint: "(인자 없음)"
 아래 명령을 그대로 한 번 실행하고, 출력을 그대로 사용자에게 보여준다.
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/skills/yultopia}/bin/codex-review.sh" session-status "$CLAUDE_CODE_SESSION_ID"
+codex-review.sh session-status "$CLAUDE_CODE_SESSION_ID"
 ```
 
 명령 출력 외에 다른 설명을 덧붙이지 않는다.
