@@ -86,29 +86,30 @@ AI에게 코드 리뷰를 시키면 흔히 이렇게 망가진다.
 
 **자동 검수를 켜면 응답이 느려진다.** Claude가 응답을 마칠 때마다 Codex 검수가 돌고, 훅 타임아웃이 400초로 잡혀 있다. 짧은 대화를 여러 번 주고받는 상황에서는 체감이 크다. 껐다 켜며 쓰는 것을 권한다.
 
-**스크립트 위치 찾기.** 아래 두 기능은 스킬이 아니라 스크립트를 직접 실행한다. 설치 방식에 따라 경로가 다르므로 먼저 찾는다.
+**대기 시간 상한.** Codex 한 번 호출은 최대 5분(`CODEX_REVIEW_TIMEOUT`), 한 턴에 최대 2라운드(`CODEX_REVIEW_MAX_ROUNDS`)다. 그보다 오래 걸린 것처럼 느껴진다면 검수 자체가 아니라 「검수 → Claude가 수정 → 재검수」 사이클 전체 시간이다.
+
+**스크립트 직접 실행.** 아래 기능은 스킬이 아니라 스크립트로 쓴다. Claude Code가 설치된 플러그인의 `bin/` 을 PATH에 넣어주므로 경로 없이 그대로 실행한다.
 
 ```bash
-find ~/.claude -name codex-review.sh -path '*yultopia*' 2>/dev/null
+codex-review.sh disable      # 비상 정지 — 모든 세션의 검수를 즉시 중단
+codex-review.sh show-last    # 직전 검수 원문 보기
+codex-review.sh status       # 전역 상태
 ```
 
-**비상 정지.** 검수가 멈추지 않으면 전부 끌 수 있다.
+**검수가 도는 중인지 보기.** 검수는 Stop 훅이라 도는 동안 터미널이 멈춘 것처럼 보인다. 다른 창에서 상태를 확인할 수 있다.
 
 ```bash
-"$(find ~/.claude -name codex-review.sh -path '*yultopia*' | head -1)" disable
+codex-review.sh progress     # 지금 도는 중인지 / 조용한 건지 / 끝난 건지 한 번 판정
+codex-review.sh watch        # 같은 정보를 이벤트 스트림으로 (Claude의 Monitor에 물려 쓴다)
 ```
 
-**직전 검수 원문 보기.**
+`progress` 는 프로세스 생존과 진행 로그를 함께 본다. **로그가 조용한 것만으로는 멈춘 게 아니다** — Codex는 도구를 돌릴 때만 로그를 쓰고 최종 답변을 작성하는 동안은 조용하다.
 
-```bash
-"$(find ~/.claude -name codex-review.sh -path '*yultopia*' | head -1)" show-last
-```
+**`codex exec` 를 직접 돌릴 때는 stdin을 닫는다.** `codex exec ... </dev/null`. 안 닫으면 프롬프트를 인자로 줬어도 `Reading additional input from stdin...` 상태로 EOF를 기다리며 무한정 멈춘다.
 
 ## (선택) 자연어로 부르기
 
 말로 부르고 싶으면 `~/.claude/CLAUDE.md`에 아래를 직접 넣는다. **넣지 않아도 슬래시 명령은 전부 동작한다.**
-
-`<스크립트경로>` 자리에는 위 「스크립트 위치 찾기」로 확인한 실제 경로를 넣는다.
 
 ```markdown
 ## Yultopia 협업 모드
@@ -118,9 +119,10 @@ find ~/.claude -name codex-review.sh -path '*yultopia*' 2>/dev/null
 
 | 사용자 표현 | 실행할 명령 |
 |---|---|
-| "코덱스 검수 원문 보여줘" | `<스크립트경로> show-last` |
+| "코덱스 검수 원문 보여줘" | `codex-review.sh show-last` |
 | "협업 모드 상태 알려줘" | `/yultopia:collab-status` 스킬 |
-| "코덱스 검수 전부 멈춰줘" (비상) | `<스크립트경로> disable` |
+| "코덱스 뭐함?" / "아직 도냐?" | `codex-review.sh progress` |
+| "코덱스 검수 전부 멈춰줘" (비상) | `codex-review.sh disable` |
 
 원문을 요청받으면 `show-last` 출력을 **그대로** 보여준다. 요약하거나 고쳐 쓰지 않는다.
 원문이 없거나 만료됐으면 그 사실을 그대로 전한다.

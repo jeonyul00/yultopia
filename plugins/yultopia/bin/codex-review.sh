@@ -12,6 +12,12 @@
 #
 # 조회 / 전역 비상정지
 #   show-last [cwd] | status | enable | disable | uninstall
+#   progress [로그파일|저장소경로]
+#                  : 지금 Codex 가 도는 중인지, 조용한 건지, 멈춘 건지 한 번 판정
+#                    (프로세스 생존 + 진행 로그 mtime 을 함께 본다)
+#   watch [로그파일|저장소경로]
+#                  : 같은 정보를 이벤트 스트림으로. 새 이벤트를 한 줄씩 뱉고
+#                    턴이 끝나면 종료한다. Claude 의 Monitor 도구에 물려 쓴다.
 #
 # 불변 규칙
 #   - Stop 알림에 hookSpecificOutput.additionalContext 를 절대 쓰지 않는다.
@@ -36,11 +42,20 @@ SESSION_TTL_HOURS="${CODEX_REVIEW_SESSION_TTL_HOURS:-168}"   # 7일. 사용 때�
 KILL_FILE="${CODEX_REVIEW_KILL_FILE:-$CLAUDE_HOME/codex-review.off}"
 MAX_FINDINGS="${CODEX_REVIEW_MAX_FINDINGS:-20}"
 MAX_STRLEN="${CODEX_REVIEW_MAX_STRLEN:-600}"
+# progress 판정 기준. Codex 는 도구를 돌릴 때만 이벤트를 뱉고 최종 답변을 쓰는
+# 동안은 조용하다. 그래서 "조용함"만으로는 멈춤이라고 볼 수 없다.
+QUIET_SECS="${CODEX_REVIEW_QUIET_SECS:-60}"
+STALL_SECS="${CODEX_REVIEW_STALL_SECS:-600}"
+WATCH_POLL="${CODEX_REVIEW_WATCH_POLL:-5}"
+WATCH_GRACE="${CODEX_REVIEW_WATCH_GRACE:-30}"
+# 진행 로그에 남길 명령 출력 길이. 저장소 내용이 통째로 쌓이지 않게 자른다.
+KEEP_OUTPUT="${CODEX_REVIEW_KEEP_OUTPUT:-200}"
 
 SESS_DIR="$STATE_DIR/sessions"
 TURN_DIR="$STATE_DIR/turns"
 RAW_DIR="$STATE_DIR/raw"
-mkdir -p "$SESS_DIR" "$TURN_DIR" "$RAW_DIR" 2>/dev/null
+PROG_DIR="$STATE_DIR/progress"
+mkdir -p "$SESS_DIR" "$TURN_DIR" "$RAW_DIR" "$PROG_DIR" 2>/dev/null
 
 # macOS 는 shasum, 대부분의 리눅스는 sha256sum 이다. 둘 다 지원한다.
 if command -v shasum >/dev/null 2>&1; then
@@ -52,6 +67,18 @@ else
   exit 1
 fi
 key() { printf '%s' "$1" | sha | cut -c1-32; }
+
+# macOS(BSD) 와 리눅스(GNU) 는 stat 옵션이 다르다. 둘 다 지원한다.
+mtime_of() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+size_of()  { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null; }
+age_of()   { local m; m="$(mtime_of "$1")"; [ -n "$m" ] && echo $(( $(date +%s) - m )) || echo 0; }
+dur()      { local s="${1:-0}"; if [ "$s" -lt 60 ]; then printf '%d초' "$s"
+             else printf '%d분 %d초' $((s / 60)) $((s % 60)); fi; }
+
+# 돌고 있는 codex exec 프로세스. pid 를 앞에 두므로 command 앞에는 항상 공백이 있다.
+codex_procs()   { ps -eo pid=,etime=,%cpu=,command= 2>/dev/null \
+                  | grep -E '[[:space:]]codex[[:space:]]+exec([[:space:]]|$)' || true; }
+codex_running() { [ -n "$(codex_procs)" ]; }
 
 # ---- 훅 출력 ------------------------------------------------------------
 # 조용히 끝냄 (아무 것도 표시하지 않음)
@@ -98,6 +125,7 @@ atomic_write() {
 }
 
 ttl_sweep() {
+  find "$PROG_DIR" -maxdepth 1 -type f -mmin "+$((TTL_HOURS * 60))" -delete 2>/dev/null
   find "$RAW_DIR"  -maxdepth 1 -type f -mmin "+$((TTL_HOURS * 60))" -delete 2>/dev/null
   find "$TURN_DIR" -mindepth 2 -type f -mmin "+$((TTL_HOURS * 60))" -delete 2>/dev/null
   find "$SESS_DIR" -maxdepth 1 -type f -mmin "+$((SESSION_TTL_HOURS * 60))" -delete 2>/dev/null
@@ -193,6 +221,109 @@ case "$MODE" in
     r=$(find "$RAW_DIR" -name '*.raw' 2>/dev/null | wc -l | tr -d ' ')
     echo "보관 중인 검수 원문: ${r}건 (${TTL_HOURS}시간 보관)"
     exit 0 ;;
+  progress|watch)
+    # 인자: 진행 로그 파일을 직접 주거나(수동 codex 실행), 저장소 경로를 주거나, 생략(=현재 폴더)
+    arg="${2:-}"; log=""; base="$PWD"
+    if   [ -n "$arg" ] && [ -f "$arg" ]; then log="$arg"
+    elif [ -n "$arg" ] && [ -d "$arg" ]; then base="$arg"
+    fi
+    if [ -z "$log" ]; then
+      root="$(git -C "$base" rev-parse --show-toplevel 2>/dev/null)"
+      [ -n "$root" ] && [ -f "$PROG_DIR/$(key "$root").jsonl" ] && log="$PROG_DIR/$(key "$root").jsonl"
+      [ -n "$log" ] || log="$(ls -t "$PROG_DIR"/*.jsonl 2>/dev/null | head -1)"
+    fi
+
+    # ---- watch: Monitor 도구에 물리는 이벤트 스트림 ----------------------
+    # 새 이벤트를 한 줄씩 뱉고, 턴이 끝나거나 codex 프로세스가 사라지면 종료한다.
+    if [ "$MODE" = "watch" ]; then
+      [ -n "$log" ] || { echo "감시할 진행 로그가 없습니다."; exit 1; }
+      seen=0; warned=0; waited=0
+      while :; do
+        if [ -f "$log" ]; then
+          n="$(wc -l < "$log" 2>/dev/null | tr -d ' ')"; n="${n:-0}"
+          if [ "$n" -gt "$seen" ]; then
+            sed -n "$((seen + 1)),${n}p" "$log" | jq -r '
+              def cmd: (.item.command // "") | gsub("\\s+"; " ") | .[0:70];
+              if   .type == "item.started"   and .item.type == "command_execution" then "▸ " + cmd
+              elif .type == "item.completed" and .item.type == "command_execution"
+                   and ((.item.exit_code // 0) != 0) then "✗ exit \(.item.exit_code): " + cmd
+              elif .type == "error" or .type == "turn.failed"
+                   then "✗ 코덱스 오류: " + (tostring | .[0:150])
+              elif .type == "turn.completed" then "■ 코덱스 완료"
+              else empty end' 2>/dev/null
+            seen="$n"; warned=0
+            grep -q '"turn.completed"\|"turn.failed"' "$log" 2>/dev/null && exit 0
+          elif [ "$warned" -eq 0 ] && [ "$(age_of "$log")" -ge "$STALL_SECS" ]; then
+            echo "… 코덱스가 $(dur "$(age_of "$log")") 동안 조용합니다 (프로세스는 살아 있음)"
+            warned=1
+          fi
+        fi
+        if codex_running; then waited=0
+        else
+          waited=$((waited + WATCH_POLL))
+          if [ "$waited" -ge "$WATCH_GRACE" ]; then
+            echo "■ 코덱스 프로세스 종료됨 (turn.completed 없음 — 중단됐을 수 있음)"
+            exit 0
+          fi
+        fi
+        sleep "$WATCH_POLL"
+      done
+    fi
+
+    # ---- progress: 한 번 찍고 끝나는 현재 상태 ---------------------------
+    # 프로세스 생존이 유일하게 확실한 신호다. 로그 침묵만으로는 판정할 수 없다.
+    procs="$(codex_procs)"
+
+    if [ -z "$procs" ] && { [ -z "$log" ] || [ ! -f "$log" ]; }; then
+      echo "코덱스: 실행 중인 작업이 없습니다. (남아 있는 진행 로그도 없습니다)"
+      exit 0
+    fi
+
+    alive=0
+    if [ -n "$procs" ]; then
+      alive=1
+      echo "실행 중인 Codex:"
+      printf '%s\n' "$procs" | while read -r p e c _rest; do
+        printf '  PID %s   경과 %s   CPU %s%%\n' "$p" "$e" "$c"
+      done
+    else
+      echo "실행 중인 Codex: 없음"
+    fi
+
+    if [ -n "$log" ] && [ -f "$log" ]; then
+      a="$(age_of "$log")"
+      echo "진행 로그: $log"
+      echo "  크기 $(size_of "$log") bytes / 마지막 기록 $(dur "$a") 전"
+      # grep -c 는 매치가 없어도 0 을 찍고 exit 1 이다. || true 로 값만 받는다.
+      n="$(grep -c '"item.started"' "$log" 2>/dev/null || true)"
+      echo "  도구 실행 ${n:-0}회"
+      echo "  최근 활동:"
+      jq -r '
+        def cmd: (.item.command // "") | gsub("\\s+"; " ") | .[0:80];
+        if   .type == "thread.started"  then "    ● 시작"
+        elif .type == "item.started"    and .item.type == "command_execution"
+             then "    ▸ 실행 중: " + cmd
+        elif .type == "item.completed"  and .item.type == "command_execution"
+             then "    ✓ exit \(.item.exit_code // "?"): " + cmd
+        elif .type == "item.completed"  and .item.type == "agent_message"
+             then "    ✎ 메시지 \(.item.text // "" | length)자"
+        elif .type == "turn.completed"  then "    ■ 턴 완료"
+        else empty end' "$log" 2>/dev/null | tail -5
+    else
+      a=-1
+      echo "진행 로그: 없음 (수동 실행이면 로그 파일 경로를 인자로 주세요)"
+    fi
+
+    if [ "$alive" -eq 0 ]; then
+      echo "판정: 프로세스 없음 — 완료됐거나 중단됨. 결과 파일을 확인하세요."
+    elif [ "$a" -lt 0 ] || [ "$a" -le "$QUIET_SECS" ]; then
+      echo "판정: 조사 중 — 도구를 돌리는 중입니다."
+    elif [ "$a" -lt "$STALL_SECS" ]; then
+      echo "판정: 정상 — 도구를 안 쓰는 구간이라 조용합니다 (최종 답변 작성 중으로 보입니다)."
+    else
+      echo "판정: $(dur "$a") 동안 조용합니다 — 확인이 필요할 수 있습니다."
+    fi
+    exit 0 ;;
   show-last)
     root="$(git -C "${2:-$PWD}" rev-parse --show-toplevel 2>/dev/null)"
     f=""
@@ -272,7 +403,7 @@ fi
 
 # =========================== stop 모드 ===================================
 if [ "$MODE" != "stop" ]; then
-  echo "usage: codex-review.sh {start|stop|session-enable|session-disable|session-status|status|show-last|enable|disable|uninstall}" >&2
+  echo "usage: codex-review.sh {start|stop|session-enable|session-disable|session-status|status|show-last|progress|watch|enable|disable|uninstall}" >&2
   exit 1
 fi
 
@@ -343,10 +474,26 @@ PROMPT="너는 독립적인 코드 리뷰어다. 코드를 수정하지 마라. 
 - 확신이 없으면 넣지 마라.
 - P1(확실한 오류)이 하나라도 있으면 verdict 는 block, 아니면 pass."
 
+# 진행 로그. --json 이벤트를 그대로 흘려서 검수가 도는 동안에도
+# 다른 창에서 `codex-review.sh progress` 로 상태를 볼 수 있게 한다.
+plog="$PROG_DIR/$pkey.jsonl"
+
+# stdin 을 반드시 닫는다. 파이프가 열려 있으면 Codex 가 프롬프트를 인자로 받고도
+# "Reading additional input from stdin..." 상태로 EOF 를 기다리며 멈춘다.
 rc=0
-run_with_timeout "$TIMEOUT" "$CODEX_BIN" exec \
+run_with_timeout "$TIMEOUT" "$CODEX_BIN" exec --json \
   --ephemeral -s read-only -C "$root" \
-  --output-schema "$SCHEMA" -o "$out" "$PROMPT" >/dev/null 2>&1 || rc=$?
+  --output-schema "$SCHEMA" -o "$out" "$PROMPT" \
+  </dev/null >"$plog" 2>"$PROG_DIR/$pkey.err" || rc=$?
+
+# 명령 출력 본문은 앞부분만 남긴다. 진행 표시에는 필요 없고,
+# 저장소 내용이 통째로 디스크에 쌓이는 것도 막는다.
+if [ -s "$plog" ]; then
+  ptmp="$(mktemp)"
+  if jq -c --argjson n "$KEEP_OUTPUT" \
+       'if .item.aggregated_output? then .item.aggregated_output |= .[0:$n] else . end' \
+       "$plog" > "$ptmp" 2>/dev/null; then mv -f "$ptmp" "$plog"; else rm -f "$ptmp"; fi
+fi
 
 save_raw() {
   [ -s "$out" ] && cp -f "$out" "$RAW_DIR/$pkey.raw" 2>/dev/null
