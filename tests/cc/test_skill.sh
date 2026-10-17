@@ -162,3 +162,93 @@ test_skill_covers_unconfirmed_stop_broken_discard_and_plan_question() {
   assert_contains "$s4" "\`ask_user\`"
   assert_contains "$s4" "Codex 질문:"
 }
+# ---- R31/R32: Codex 가 테스트를 직접 돌리고, Codex 가 프로젝트 파일을 바꾸면 멈춰 묻는다 ----
+test_skill_codex_runs_tests_and_stops_on_codex_edits() {
+  desc=$(skill_frontmatter | sed -n 's/^description: //p')
+  assert_not_contains "$desc" "read-only"
+  assert_contains "$desc" "tests"
+  s=$(cat "$SKILL_FILE")
+  assert_not_contains "$s" "읽기 전용"
+  # Codex 는 테스트를 직접 돌린다. 그래도 Claude 는 검수 요청 전에 직접 돌려 기록한다 (Codex 가 비교)
+  s0=$(awk '/^# cc$/ { on = 1 } on && /^## 1\./ { exit } on { print }' "$SKILL_FILE")
+  assert_contains "$s0" "테스트·빌드를 직접 돌려"
+  s5=$(skill_section 5)
+  assert_contains "$s5" "Codex도 검수할 때 같은 명령을 직접 돌려"
+  assert_contains "$s5" "비교"
+  # wait 3 의 "Codex가 프로젝트 파일을 바꿨습니다": 멈추고, 줄과 diff 요약을 보여 주고, 되돌리지 않았다고 설명하고 묻는다
+  s7=$(skill_section 7)
+  assert_contains "$s7" "\"Codex가 프로젝트 파일을 바꿨습니다\""
+  assert_contains "$s7" "git diff <pre> <post> --stat"
+  assert_contains "$s7" "되돌리지 않았다"
+  assert_contains "$s7" "직접 고친 파일"
+  assert_contains "$s7" "그대로 둘지"
+  assert_contains "$s7" "자동으로 이어 가지 않는다"
+  # 대기가 끊긴 줄(130), Codex 멈추기, 이어 하기에서도 같은 처리
+  s8=$(skill_section 8); assert_contains "$s8" "Codex가 프로젝트 파일을 바꿨습니다"
+  stop=$(awk '/^\*\*Codex 멈추기\*\*/ { on = 1 } on && /^## / { exit } on { print }' "$SKILL_FILE")
+  assert_contains "$stop" "Codex가 프로젝트 파일을 바꿨습니다"
+  s10=$(skill_section 10); assert_contains "$s10" "Codex가 프로젝트 파일을 바꿨습니다"
+}
+# ---- 사용자 요구 (2026-10-18): Codex 결과가 올 때마다 한 줄 요약이 아니라 Codex 답변 자체를 보여주고 쉽게 설명한다 ----
+test_skill_always_shows_codex_answer_verbatim() {
+  s6=$(skill_section 6)
+  show=$(awk '/^\*\*Codex 답변 보여주기\*\*/ { on = 1; print; next } on && /^\*\*/ { exit } on { print }' "$SKILL_FILE")
+  [ -n "$show" ] || _fail "Codex 답변 보여주기 절차가 없음"
+  # 언제: wait 0 으로 결과가 올 때마다 (계획·검수·메시지 답변, verdict 무관)
+  assert_contains "$show" "\`wait\` 가 0"
+  assert_contains "$show" "계획·검수·메시지 답변 모두"
+  assert_contains "$show" "\`verdict\` 가 무엇이든"
+  # 무엇을: 한 줄 요약으로 대신하지 않고 그대로 (읽기 쉬운 목록은 괜찮음)
+  assert_contains "$show" "한 줄 요약으로 대신하지 말고"
+  assert_contains "$show" "Codex 답변 자체를 사용자에게 보여준다"
+  assert_contains "$show" "그대로 옮긴다"
+  assert_contains "$show" "짧은 목록"
+  for f in '`verdict`' '`summary`' '`instruction` 전문' '`findings` 전부' '파일, 줄, 문제(`issue`), 근거(`evidence`)' '`question`' '`plan`'; do
+    assert_contains "$show" "$f"
+  done
+  # 그 뒤 쉬운 한국어 한두 문장으로 다음에 할 일
+  assert_contains "$show" "쉬운 한국어 한두 문장으로 이제 무엇을 하는지"
+  # 진행 줄은 그대로 쓰지만 대신하지 않는다. 이벤트 로그는 붙이지 않는다
+  assert_contains "$show" "진행 줄이 Codex 답변 보여주기를 대신하지 않는다"
+  assert_contains "$show" "이벤트 로그"
+  assert_contains "$show" "결과 JSON 의 필드뿐"
+  # 모든 결과 처리 경로가 이 절차를 먼저 거친다
+  assert_contains "$s6" "**\`call review\` 의 결과** (마일스톤 검수. 어느 결과든 먼저 위 \"Codex 답변 보여주기\")"
+  assert_contains "$s6" "어느 결과든 먼저 위 \"Codex 답변 보여주기\"):"
+  assert_not_contains "$s6" "summary\` 와 필요한 부분만 짧게"
+  assert_not_contains "$s6" "한 줄만 보여준다"
+  assert_contains "$(skill_section 4)" "Codex 답변 보여주기"
+  assert_contains "$(skill_section 10)" "Codex 답변 보여주기"
+}
+# ---- Codex 리뷰 1차 (R32) 2·3·4: 나중에 다시 비교한 결과·확인 실패 줄도 멈춰서 알린다 ----
+test_skill_handles_rechecked_edits_and_unchecked_tree() {
+  s7=$(skill_section 7)
+  # call 6: 끝나지 않았던 이전 호출을 새 호출 전에 다시 비교한 결과
+  assert_contains "$s7" "\`call\` 이 6 이고 줄에 \"Codex가 프로젝트 파일을 바꿨습니다\""
+  # wait 3·call 6: 실행 뒤 작업 트리를 확인하지 못함
+  assert_contains "$s7" "\"작업 트리를 확인하지 못해\""
+  assert_contains "$s7" "git diff <pre>"
+  # 종료를 확인하지 못해 결과를 반영하지 않은 줄
+  assert_contains "$s7" "\"결과를 반영하지 않았\""
+}
+test_skill_stop_and_interrupt_lines_with_unchecked_tree() {
+  stop=$(awk '/^\*\*Codex 멈추기\*\*/ { on = 1 } on && /^## / { exit } on { print }' "$SKILL_FILE")
+  assert_contains "$stop" "\"작업 트리를 확인하지 못해\""
+  s8=$(skill_section 8); assert_contains "$s8" "\"작업 트리를 확인하지 못해\""
+}
+test_skill_codex_modified_with_pending_recheck() {
+  # Codex 리뷰 2차: 종료를 확인하지 못한 codex_modified 는 남은 프로세스가 끝난 뒤 다시 비교해 최종 목록으로 고쳐진다
+  s7=$(skill_section 7)
+  assert_contains "$s7" "\"다시 확인합니다\""
+  assert_contains "$s7" "최종 목록"
+}
+test_skill_final_recheck_lines_and_stale_notice() {
+  # Codex 리뷰 3차: 다시 비교를 마친 줄은 최종 결과다 (다시 기다리지 않는다). preflight 의 stale_notice 로 와도 같은 처리
+  s7=$(skill_section 7)
+  assert_contains "$s7" "\"다시 확인:\""
+  assert_contains "$s7" "더 기다리지 않는다"
+  s2=$(skill_section 2)
+  assert_contains "$s2" "stale_notice"
+  assert_contains "$s2" "\"Codex가 프로젝트 파일을 바꿨습니다\""
+  assert_contains "$s2" "7장"
+}

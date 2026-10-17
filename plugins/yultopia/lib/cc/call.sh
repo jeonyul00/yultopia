@@ -33,6 +33,21 @@
 #     preflight·버리기·마무리·14일 정리가 계속 이 기록으로 살아 있음·판단 불가·남은 그룹을 본다. 정말 사라진 것(dead)이
 #     확인되면 죽은 기록 정리가 running 만 지운다 (끝 상태는 그대로. wait.sh 의 _cc_wait_settle).
 #     wait 는 stop_failed 기록을 "끝난 호출" 로 보고 기록된 결과를 곧바로 돌려준다. call 은 이 기록이 dead 가 될 때까지 거부한다.
+#   Codex 의 프로젝트 파일 수정 감시 (R31/R32): Codex 는 workspace-write 로 돈다 (테스트를 직접 돌리도록).
+#     codex 를 실행할 때마다(첫 실행·빠른 실패 재실행·형식 재요청) 실행 직전에 작업 트리 스냅샷(pre)을 뜨고, codex 가 끝나고
+#     그룹을 정리한 뒤(정상 종료·실패·시간 상한·중단 신호 모두) 다시 뜬다(post). 스냅샷은 추적 파일 + 무시되지 않은 새 파일이다
+#     (git 이 무시하는 캐시·빌드 결과물은 바뀌어도 된다).
+#     - pre != post → 끝 상태 codex_modified (재시도·형식 재요청 없음, result 를 state 에 반영하지 않음, phase=failed).
+#       last_call.message 는 바뀐 파일(최대 10개, git diff --name-only pre post)과 확인 명령을 담은 한 줄,
+#       last_call.pre_tree / post_tree 에 두 트리를 남긴다. 아무것도 되돌리거나 지우지 않는다.
+#       Codex 실행 중에 사용자가 고친 파일도 같이 잡힌다 (그래서 메시지는 "Codex 실행 중에 바뀐 파일" 이라고 쓴다).
+#     - pre 를 뜨지 못함 → codex 를 실행하지 않고 error. post 를 뜨지 못함 → 끝난 원인(정상·시간 상한·중단 신호)과 상관없이
+#       결과를 반영하지 않고 error (확인할 수 없음. Codex 리뷰 1차 4).
+#     - pre 는 codex 를 띄우기 전에 running.pre_tree 로 state 에 남긴다 (못 남기면 실행하지 않음). 감독 프로세스가 끝 상태 없이
+#       죽어도 그룹이 사라진 것을 확인한 쪽(wait·check-orphan·preflight·call)이 이것으로 다시 비교한다 (Codex 리뷰 1차 3, wait.sh).
+#     - 그룹이 비었음을 확인하지 못했으면(stop_failed) 그 순간 같아도 안전하다고 보지 않는다: 결과를 반영하지 않고(정상
+#       응답이어도 error) 재시도도 하지 않는다. 그룹이 확실히 사라진 뒤 위와 같이 다시 비교한다 (Codex 리뷰 1차 2).
+#     - 하위 모듈 안의 변경도 잡힌다 (snapshot.sh, Codex 리뷰 1차 1).
 
 _CC_CALL_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 CC_SCHEMA_FILE="$_CC_CALL_LIB/pm-output.schema.json"
@@ -48,18 +63,20 @@ _cc_file_size() {
 }
 
 # cc_codex_argv <exec|resume> <session_id|-> <call_dir> : codex 인자를 NUL 로 구분해 출력.
-#   모델·추론 강도 인자는 절대 넣지 않는다 (사용자 Codex 설정 그대로). 강제하는 것은 읽기 전용 sandbox 뿐.
+#   모델·추론 강도 인자는 절대 넣지 않는다 (사용자 Codex 설정 그대로). 강제하는 것은 sandbox 뿐:
+#   Codex 가 실제 프로젝트에서 테스트·빌드·린트를 직접 돌리도록 workspace-write (R31). 네트워크 설정은 덮어쓰지 않는다
+#   (Codex 기본값: 막힘). Codex 가 프로젝트 파일을 바꾸는지는 감독 프로세스가 실행 전후 작업 트리로 확인한다 (R32).
 #   프롬프트는 stdin 으로 받는다(마지막 인자 "-"). resume 에는 -C 가 없으므로 저장소 루트에서 실행한다.
 cc_codex_argv() {
   local mode="$1" sid="$2" dir="$3"
   [ -n "$dir" ] || return 1
   case "$mode" in
     exec)
-      printf '%s\0' exec --json -s read-only --output-schema "$CC_SCHEMA_FILE" -o "$dir/result.json" - ;;
+      printf '%s\0' exec --json -s workspace-write --output-schema "$CC_SCHEMA_FILE" -o "$dir/result.json" - ;;
     resume)
       # 세션 ID 는 옵션으로 읽히지 않는 평범한 식별자여야 한다
       case "$sid" in ''|-*|*[!A-Za-z0-9._:-]*) return 1 ;; esac
-      printf '%s\0' exec resume --json -c 'sandbox_mode="read-only"' --output-schema "$CC_SCHEMA_FILE" \
+      printf '%s\0' exec resume --json -c 'sandbox_mode="workspace-write"' --output-schema "$CC_SCHEMA_FILE" \
         -o "$dir/result.json" "$sid" - ;;
     *) return 1 ;;
   esac
@@ -333,6 +350,27 @@ _cc_call_start_locked() {
   cc_line "[cc] Codex 호출 시작: $(_cc_call_label "$kind") (호출 $n/$CC_MAX_CALLS)"
 }
 
+# _cc_call_settle_dead_record <active> <state-json> : 확실히 끝난(dead) 이전 호출 기록에 실행 전 트리(running.pre_tree)가
+#   있고 아직 다시 비교하지 않았으면, 새 호출로 덮어쓰기 전에 정리하며 다시 비교한다 (Codex 리뷰 1차 2·3. wait.sh 의
+#   _cc_wait_settle → _cc_edit_recheck_prepare). 그 결과 Codex 가 프로젝트 파일을 바꿨거나 확인하지 못했으면 그 한 줄을
+#   출력하고 6 (사용자가 알 때까지 새 호출을 하지 않는다. 기록은 정리됐으므로 다음 call 은 그대로 된다). 아니면 0.
+_cc_call_settle_dead_record() {
+  local a="$1" st="$2" id
+  _cc_call_liveness "$st"
+  [ "$_CC_LIVENESS" = dead ] || return 0
+  id=$(_cc_jq_get "$st" 'if (.running | type) == "object" then (.running.call_id // empty | tostring) else empty end')
+  case "$id" in ''|0*|*[!0-9]*|??????????*) return 0 ;; esac
+  _CC_WAIT_ACTIVE=$a
+  if ! _cc_edit_settle_dead "$id"; then
+    # 최종 비교 결과를 기록하지 못했다: 이 기록(실행 전 트리)을 새 호출로 덮어쓰지 않는다 (Codex 리뷰 4차 1)
+    cc_line "[cc] 끝난 이전 Codex 호출 $id 의 최종 비교 결과를 상태 파일에 기록하지 못해 새로 호출하지 않았습니다. 잠시 뒤 다시 시도하세요."
+    return 1
+  fi
+  [ -n "$_CC_EDIT_NEW_LINE" ] || return 0
+  cc_line "$_CC_EDIT_NEW_LINE"
+  return 6
+}
+
 # cc-codex.sh call <plan|review|message>
 cc_cmd_call() {
   local kind="${1:-}" a st rt="" rc
@@ -343,6 +381,9 @@ cc_cmd_call() {
   cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다."; return 1; }
   cc_active_path_safe || { cc_line "[cc] 상태 폴더 경로가 비정상입니다."; return 1; }
   a=$(cc_active_dir) || { cc_line "[cc] git 저장소가 아닙니다."; return 1; }
+  st=$(_cc_call_read_state "$a") || { cc_line "[cc] 상태 파일을 읽을 수 없습니다."; return 1; }
+  # 끝난 이전 호출 기록을 덮어쓰기 전에 Codex 의 파일 수정을 다시 비교한다 (Codex 리뷰 1차 2·3)
+  _cc_call_settle_dead_record "$a" "$st" || return $?
   st=$(_cc_call_read_state "$a") || { cc_line "[cc] 상태 파일을 읽을 수 없습니다."; return 1; }
   # 잠금 전에 한 번 거른다 (거부될 호출에 스냅샷을 만들지 않도록). 최종 판단은 잠금 안에서 다시 한다.
   _cc_call_refusal "$kind" "$st" || return $?
@@ -371,6 +412,10 @@ cc_cmd_call() {
 #       _CC_SUP_T0(이번 시도의 codex 시작 시각, $SECONDS), _CC_SUP_TIMED_OUT(시간 상한으로 끊음),
 #       _CC_SUP_NO_START(이번 시도에서 codex 인자를 못 만들어 아무것도 실행하지 않음),
 #       _CC_SUP_STOP_FAILED(마지막 그룹 정리가 "남은 것 없음" 을 확인하지 못함 → running 을 stop_failed 로 남김, R30),
+#       _CC_SUP_EDIT(이번 시도의 프로젝트 파일 수정 감시, R32: none 실행 안 함 / nopre 실행 전 스냅샷 실패라 실행 안 함 /
+#         pending 실행함·아직 비교 안 함 / same 바뀐 것 없음 / modified 바뀜 / unknown 실행 뒤 스냅샷 실패),
+#       _CC_SUP_PRE_TREE / _CC_SUP_POST_TREE (이번 시도의 실행 전후 작업 트리),
+#       _CC_SUP_LC_PRE / _CC_SUP_LC_POST (last_call.pre_tree / post_tree 로 남길 값. 비어 있으면 남기지 않음),
 #       _CC_SUP_TIMEOUT / _CC_SUP_FAST_FAIL / _CC_SUP_POLL / _CC_SUP_MAX_CALLS (검사한 설정값)
 
 _cc_sup_log() { printf '%s [call %s] %s\n' "$(cc_now_iso)" "${_CC_SUP_ID:-?}" "$*"; }
@@ -514,6 +559,66 @@ _cc_sup_stop_and_note() {
   fi
 }
 
+# ---- 프로젝트 파일 수정 감시 (R31/R32) ----
+# _cc_sup_edit_check : 이번 시도의 codex 가 끝나고 그룹을 정리한 뒤 작업 트리를 다시 떠서 실행 전(_CC_SUP_PRE_TREE)과 비교한다.
+#   _CC_SUP_EDIT 이 pending(실행함, 아직 비교 안 함)이나 unknown(앞서 스냅샷 실패: 중단 신호로 git 이 끊긴 경우 등)일 때만
+#   한다 → same | modified | unknown. 이미 정해졌으면(same·modified) 다시 하지 않는다. 아무것도 되돌리거나 지우지 않는다.
+_cc_sup_edit_check() {
+  local post
+  case "${_CC_SUP_EDIT:-none}" in pending|unknown) ;; *) return 0 ;; esac
+  post=$(cc_snapshot_tree) || post=""
+  if [ -z "$post" ]; then
+    _CC_SUP_EDIT=unknown; _CC_SUP_POST_TREE=""
+    _cc_sup_log "실행 뒤 작업 트리 스냅샷 실패 → Codex 가 파일을 바꿨는지 확인할 수 없음"
+    return 0
+  fi
+  _CC_SUP_POST_TREE=$post
+  if [ "$post" = "$_CC_SUP_PRE_TREE" ]; then
+    _CC_SUP_EDIT=same
+  else
+    _CC_SUP_EDIT=modified
+    _cc_sup_log "Codex 실행 중에 작업 트리가 바뀜 ($_CC_SUP_PRE_TREE → $post). 되돌리지 않음"
+  fi
+}
+
+# _cc_edit_modified_message <pre> <post> : codex_modified 의 한 줄. 바뀐 파일 최대 10개 (git diff --name-only pre post) 와 확인 명령.
+#   경로는 core.quotePath=false 로 한글을 그대로 쓰되, 제어 문자·따옴표가 든 경로는 git 이 한 줄로 따옴표 처리한다.
+#   하위 모듈 안의 변경은 하위 모듈 경로로 나온다 (snapshot.sh). Codex 실행 중에 사용자가 고친 파일도 잡히므로
+#   "Codex 실행 중에 바뀐 파일" 이라고 쓴다. 감독 프로세스와, 끝 상태 없이 끝난 호출을 다시 비교하는 쪽(wait.sh)이 함께 쓴다.
+_cc_edit_modified_message() {
+  local pre="$1" post="$2" names total shown more=""
+  names=$(git -c core.quotePath=false --no-pager diff --no-ext-diff --no-renames --name-only "$pre" "$post" -- 2>/dev/null \
+          | grep -v '^$')
+  total=$(printf '%s\n' "$names" | grep -c .)
+  shown=$(printf '%s\n' "$names" | grep . | head -n 10 | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')
+  [ "${total:-0}" -gt 10 ] && more=" … (외 $((total - 10))개)"
+  [ -n "$shown" ] || shown="(목록을 읽지 못함)"
+  printf '[cc] Codex가 프로젝트 파일을 바꿨습니다(되돌리지 않음) — Codex 실행 중에 바뀐 파일: %s%s · 확인: git diff %s %s' \
+    "$shown" "$more" "$pre" "$post"
+}
+
+# _cc_edit_uncheck_note <pre> : 실행 뒤 스냅샷을 뜨지 못했을 때 메시지에 붙이는 말 (확인할 수 없음. 실행 전 트리와 지금을 비교하는 명령)
+#   wait.sh 의 _CC_WAIT_UNCHECK_MARK 가 이 문구의 앞부분을 찾는다
+_cc_edit_uncheck_note() {
+  printf '실행 뒤 작업 트리를 확인하지 못해 Codex가 프로젝트 파일을 바꿨는지 알 수 없습니다 (확인: git diff %s)' "$1"
+}
+
+# _cc_edit_pending_note : 종료를 확인하지 못해(R30) 파일 변경 비교를 끝내지 못했을 때 붙이는 말 (Codex 리뷰 1차 2).
+#   그룹이 확실히 사라진 것을 확인하는 쪽(wait·check-orphan·preflight·call)이 running.pre_tree 로 다시 비교한다 (wait.sh)
+_cc_edit_pending_note() {
+  printf '프로젝트 파일 변경은 남은 Codex 프로세스가 끝난 뒤 다시 확인합니다'
+}
+
+# _cc_sup_record_pre <tree> : 이번 시도의 실행 전 트리를 codex 를 띄우기 전에 running.pre_tree 로 남긴다 (Codex 리뷰 1차 3).
+#   감독 프로세스가 기록 없이 죽어도(중단 처리의 유예를 넘겨 KILL 등) wait·check-orphan 이 이것으로 비교한다.
+#   running 이 아직 이 호출(call_id 와 pgid=$$)이고 stop_failed 가 아닐 때만 쓴다 (잠금 안에서 임시 파일 + mv). 못 쓰면 1
+_cc_sup_record_pre() {
+  cc_state_update 'if ((.running | type) == "object" and .running.call_id == $id and .running.pgid == $me
+                       and .running.stop_failed != true)
+                   then .running.pre_tree = $pre else error("not this call") end' \
+    --argjson id "$_CC_SUP_ID" --argjson me "$$" --arg pre "$1"
+}
+
 # codex 가 끝날 때까지 0.2초 간격으로 확인한다 (bash 가 끝난 자식을 바로 거두므로 kill -0 이 실패하면 끝난 것).
 #   - codex 신원이 아직 기록되지 않았으면 매번 기록을 시도한다.
 #   - 시간 상한을 넘으면 codex 와 그 자식을 끝내고 돌아온다 (_CC_SUP_TIMED_OUT=1). 이 감시는 감독 프로세스
@@ -547,12 +652,15 @@ _cc_sup_watch() {
 # _cc_sup_run_codex <exec|resume> <session|-> <prompt_file> : codex 를 한 번 실행하고 끝날 때까지 감시한다.
 #   codex 는 이 감독 프로세스와 같은 그룹의 자식이다 (그룹째 종료할 수 있도록). 종료 코드를 돌려준다.
 #   기록은 _CC_SUP_ATTEMPT 번째 시도의 events / stderr 파일에 쓴다. 끝나면 같은 그룹에 남은 것을 정리한다.
+#   실행 직전과 (그룹을 정리한) 뒤에 작업 트리를 떠서 비교한다 (R32): 결과는 _CC_SUP_EDIT (same | modified | unknown).
+#   실행 전 스냅샷을 뜨지 못하면 codex 를 실행하지 않는다 (_CC_SUP_EDIT=nopre, _CC_SUP_NO_START=1)
 _cc_sup_run_codex() {
   local mode="$1" session="$2" prompt="$3" x pid rc t_start events errf i=0
   local -a argv
   [ -n "${_CC_SUP_TIMEOUT:-}" ] || _cc_sup_init_config
   : "${_CC_SUP_ATTEMPT:=1}"
   _CC_SUP_NO_START=0
+  _CC_SUP_EDIT=none; _CC_SUP_PRE_TREE=""; _CC_SUP_POST_TREE=""
   argv=()
   while IFS= read -r -d '' x; do argv[${#argv[@]}]="$x"; done < <(cc_codex_argv "$mode" "$session" "$_CC_SUP_DIR")
   if [ "${#argv[@]}" -eq 0 ]; then
@@ -565,9 +673,25 @@ _cc_sup_run_codex() {
   errf=$(_cc_sup_stderr_file "$_CC_SUP_ATTEMPT")
   rm -f "$_CC_SUP_DIR/result.json"
   _CC_SUP_CODEX_IDENT=""; _CC_SUP_CODEX_RECORDED=0
+  # 실행 전 작업 트리 (R32). 뜨지 못하면 Codex 가 파일을 바꾸는지 확인할 수 없으므로 실행하지 않는다 (재실행도 없음)
+  _CC_SUP_PRE_TREE=$(cc_snapshot_tree) || _CC_SUP_PRE_TREE=""
+  if [ -z "$_CC_SUP_PRE_TREE" ]; then
+    _cc_sup_log "실행 전 작업 트리 스냅샷 실패 → codex 를 실행하지 않음"
+    _CC_SUP_EDIT=nopre; _CC_SUP_NO_START=1; _CC_SUP_ATTEMPT_SECS=0
+    return 125
+  fi
+  # 실행 전 트리를 codex 를 띄우기 전에 state(running.pre_tree)에 남긴다. 이 감독 프로세스가 기록 없이 죽어도
+  #   wait·check-orphan 이 비교할 수 있도록 (Codex 리뷰 1차 3). 남기지 못하면 실행하지 않는다
+  if ! _cc_sup_record_pre "$_CC_SUP_PRE_TREE"; then
+    _cc_sup_log "실행 전 작업 트리를 state 에 기록하지 못함 → codex 를 실행하지 않음"
+    _CC_SUP_EDIT=norecord; _CC_SUP_NO_START=1; _CC_SUP_ATTEMPT_SECS=0
+    return 125
+  fi
   _cc_sup_log "codex 실행 ($mode, 시도 $_CC_SUP_ATTEMPT)"
   t_start=$SECONDS
   _CC_SUP_T0=$t_start        # 시간 상한은 이 시도의 codex 시작부터 (Ruling R16)
+  # 실행하기 전에 표시한다: 바로 뒤에 신호가 와도 마무리(_cc_sup_on_exit)가 실행 뒤 비교를 한다
+  _CC_SUP_EDIT=pending
   "$CC_CODEX_BIN" "${argv[@]}" < "$prompt" >> "$events" 2>> "$errf" &
   pid=$!
   _CC_SUP_CODEX_PID=$pid
@@ -585,6 +709,8 @@ _cc_sup_run_codex() {
   _cc_sup_log "codex 종료 (코드 $rc, ${_CC_SUP_ATTEMPT_SECS}초)"
   # codex 가 끝난 뒤에도 같은 그룹에 남은 것(codex 의 자식 등)을 끝낸다 (addendum D). 시간 상한이면 이미 했다.
   [ "${_CC_SUP_TIMED_OUT:-0}" = 1 ] || _cc_sup_stop_and_note
+  # 그룹을 정리한 뒤 실행 전 트리와 비교한다 (R32. 어떻게 끝났든: 정상·실패·시간 상한)
+  _cc_sup_edit_check
   return "$rc"
 }
 
@@ -651,6 +777,8 @@ _cc_sup_write_status() {
 # minor d). 그래서 같은 호출을 두 번 반영해도 두 번째는 아무것도 바꾸지 않는다(토큰 중복 없음).
 # $keep = 1 (그룹이 비었음을 확인하지 못함, R30): 끝 상태는 똑같이 기록하고 running 은 지우지 않고 stop_failed 로 표시한다.
 #   이미 stop_failed 인 기록(끝 상태가 기록됨)은 다시 바꾸지 않는다.
+# $pre / $post 가 비어 있지 않으면 last_call.pre_tree / post_tree 로 남긴다 (R32: codex_modified, 실행 뒤 확인 불가).
+#   codex_modified 는 ok 가 아니므로 result 를 반영하지 않고 phase=failed 다.
 # Ruling R27: 마일스톤을 승인·반려하는 것은 review 호출의 결과뿐이다. message 호출(사용자 말·Claude 반대 의견 전달)은
 # diff 를 검수하지 않으므로 그 결과는 "이어가기" 다:
 #   - approve: 마일스톤 번호·milestone_base_tree·rejects_in_row 를 그대로 둔다 (Codex 가 다른 번호를 말해도 지금
@@ -697,9 +825,11 @@ if ((.running | type) == "object" and .running.call_id == $id and .running.pgid 
     | (if $st == "ok" then apply_verdict($r[0]; (.running.kind // ""))
        elif $st == "interrupted" then .phase = "interrupted"
        else .phase = "failed" end)
-    | .last_call = {call_id: $id, kind: .running.kind, status: $st,
-                    verdict: (if $st == "ok" then $r[0].verdict else null end),
-                    message: (if $msg == "" then null else $msg end)}
+    | .last_call = ({call_id: $id, kind: .running.kind, status: $st,
+                     verdict: (if $st == "ok" then $r[0].verdict else null end),
+                     message: (if $msg == "" then null else $msg end)}
+                    + (if $pre != "" then {pre_tree: $pre} else {} end)
+                    + (if $post != "" then {post_tree: $post} else {} end))
     | (if $keep == 1 then .running.stop_failed = true else .running = null end)
   else . end'
 
@@ -736,7 +866,7 @@ _cc_sup_record_result() {
   return 0
 }
 
-# _cc_sup_finish <ok|error|invalid_json|timeout|interrupted> <message> : 세션·토큰·verdict 를 state 에 반영하고
+# _cc_sup_finish <ok|error|invalid_json|timeout|interrupted|codex_modified> <message> : 세션·토큰·verdict 를 state 에 반영하고
 # running=null, last_call 을 기록한 뒤 마지막으로 status 파일을 쓴다.
 # (wait 는 status 파일을 보고 state·result 를 읽으므로 state 가 먼저다.)
 #   - 시작하자마자 TERM/INT/HUP 을 무시한다. 마무리 도중 신호가 더 와도 끝까지 기록한다 (addendum A).
@@ -755,6 +885,15 @@ _cc_sup_finish() {
   fi
   if [ "${_CC_SUP_STOP_FAILED:-0}" = 1 ]; then
     keep=1
+    # 그룹이 비었음을 확인하지 못했으면 결과를 반영하지 않는다 (Codex 리뷰 1차 2. _cc_sup_main 이 먼저 거르지만 한 번 더)
+    if [ "$st" = ok ]; then
+      st=error; msg="[cc] Codex 프로세스가 모두 끝났는지 확인하지 못해 결과를 반영하지 않았습니다"
+    fi
+    # 파일 변경 비교를 끝내지 못했다 (codex 를 실행했으면, 이미 바뀐 것을 찾았어도: 남은 프로세스가 더 바꿀 수 있다.
+    #   Codex 리뷰 2차): 남은 프로세스가 끝난 뒤 다시 확인한다고 적는다 (그때 최종 목록으로 고쳐진다, wait.sh recheck)
+    case "${_CC_SUP_EDIT:-none}" in
+      same|unknown|pending|modified) msg="${msg:-[cc] Codex 호출은 끝났지만 결과를 반영하지 않았습니다} · $(_cc_edit_pending_note)" ;;
+    esac
     note="일부 Codex 프로세스가 끝났는지 확인하지 못했습니다 (프로세스 그룹 $$. 확인: ps -o pid,command -g $$)"
     if [ -n "$msg" ]; then msg="$msg · $note"; else msg="[cc] Codex 호출은 끝났지만 $note"; fi
   fi
@@ -763,6 +902,9 @@ _cc_sup_finish() {
 $(_cc_sup_tokens_all)
 EOF
   if [ "$st" = ok ]; then rarg=(--slurpfile r "$_CC_SUP_DIR/result.json"); else rarg=(--argjson r '[]'); fi
+  # last_call.pre_tree / post_tree (R32: codex_modified·확인 불가일 때만 값이 있다)
+  rarg[${#rarg[@]}]=--arg; rarg[${#rarg[@]}]=pre; rarg[${#rarg[@]}]="${_CC_SUP_LC_PRE:-}"
+  rarg[${#rarg[@]}]=--arg; rarg[${#rarg[@]}]=post; rarg[${#rarg[@]}]="${_CC_SUP_LC_POST:-}"
   _CC_SUP_REC=""
   for i in 1 2 3; do
     _cc_sup_record_result "$st" "$msg" "$sid" "$ti" "$tc" "$to" "$keep" "${rarg[@]}" && break
@@ -807,9 +949,20 @@ _cc_sup_on_exit() {
   fi
   _cc_sup_log "비정상 종료 → $st"
   # 중단 신호여도 시간 상한 때와 같이 TERM 뒤 최대 3초를 준다: codex 가 따로 띄운 MCP 도우미를 스스로 정리할 시간이다
-  # (최종 리뷰 minor f). 멤버 TERM 3초 + KILL 최대 2초 + 기록이 기다리는 쪽(wait·check-orphan --kill)의
+  # (최종 리뷰 minor f). 멤버 TERM 3초 + KILL 최대 2초 + 실행 뒤 스냅샷 + 기록이 기다리는 쪽(wait·check-orphan --kill)의
   # 감독 프로세스 유예 10초(_CC_WAIT_SUP_GRACE_TENTHS) 안에 끝나므로 마무리 도중 KILL 되지 않는다 (Task 7 addendum A)
   _cc_sup_stop_and_note "$_CC_SUP_CODEX_PID"
+  # 이번 시도에서 codex 를 실행했으면 중단·오류로 끝나도 실행 전 트리와 비교한다 (R32).
+  #   바뀌었으면 codex_modified 가 우선한다. 확인하지 못했으면 끝난 원인과 상관없이 error(phase failed, verdict null)로
+  #   기록하고 원인과 확인 실패를 함께 적는다 (Codex 리뷰 1차 4). 어느 쪽이든 result 는 반영하지 않는다
+  _cc_sup_edit_check
+  case "${_CC_SUP_EDIT:-none}" in
+    modified)
+      st=codex_modified; msg=$(_cc_edit_modified_message "$_CC_SUP_PRE_TREE" "$_CC_SUP_POST_TREE")
+      _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_POST=$_CC_SUP_POST_TREE ;;
+    unknown)
+      st=error; msg="$msg · $(_cc_edit_uncheck_note "$_CC_SUP_PRE_TREE")"; _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE ;;
+  esac
   _cc_sup_finish "$st" "$msg"
 }
 
@@ -834,8 +987,44 @@ _cc_sup_main() {
     _cc_sup_run_codex "$mode" "$session" "$prompt"
     rc=$?
     # 인자를 만들지 못해 codex 를 실행하지 않았다: 다시 해도 같으므로 호출 번호를 쓰지 않고 끝낸다 (addendum D)
+    #   실행 전 작업 트리를 뜨지 못한 경우도 같다: Codex 가 파일을 바꾸는지 확인할 수 없으므로 실행하지 않았다 (R32)
     if [ "${_CC_SUP_NO_START:-0}" = 1 ]; then
-      _cc_sup_finish error "[cc] Codex 실행 인자를 만들지 못해 Codex를 실행하지 않았습니다 (세션 ID 형식 확인 필요)."
+      case "$_CC_SUP_EDIT" in
+        nopre)
+          _cc_sup_finish error "[cc] 작업 트리 스냅샷을 만들지 못해 Codex를 실행하지 않았습니다 (Codex가 프로젝트 파일을 바꾸는지 확인할 수 없음)." ;;
+        norecord)
+          _cc_sup_finish error "[cc] 실행 전 작업 트리를 상태 파일에 기록하지 못해 Codex를 실행하지 않았습니다 (중단돼도 Codex의 파일 수정을 확인할 수 있어야 함)." ;;
+        *)
+          _cc_sup_finish error "[cc] Codex 실행 인자를 만들지 못해 Codex를 실행하지 않았습니다 (세션 ID 형식 확인 필요)." ;;
+      esac
+      return 0
+    fi
+    # Codex 가 프로젝트 파일을 바꿨으면(R32) 어떻게 끝났든(시간 상한 포함) codex_modified 로 끝낸다:
+    #   재시도·형식 재요청 없음, result 반영 없음, 아무것도 되돌리지 않음.
+    #   실행 뒤 작업 트리를 뜨지 못했으면 확인할 수 없으므로 result 를 반영하지 않고 error 로 끝낸다.
+    case "$_CC_SUP_EDIT" in
+      modified)
+        _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_POST=$_CC_SUP_POST_TREE
+        _cc_sup_finish codex_modified "$(_cc_edit_modified_message "$_CC_SUP_PRE_TREE" "$_CC_SUP_POST_TREE")"; return 0 ;;
+      same) ;;
+      *)
+        _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE
+        if [ "$_CC_SUP_TIMED_OUT" = 1 ]; then
+          _cc_sup_finish error "$(_cc_sup_timeout_message) · $(_cc_edit_uncheck_note "$_CC_SUP_PRE_TREE")"
+        else
+          _cc_sup_finish error "[cc] Codex 결과를 반영하지 않았습니다: $(_cc_edit_uncheck_note "$_CC_SUP_PRE_TREE")"
+        fi
+        return 0 ;;
+    esac
+    # 그룹이 비었음을 확인하지 못했으면(R30) 지금 "바뀐 것 없음" 이어도 안전하다고 보지 않는다 (Codex 리뷰 1차 2):
+    #   남은 프로세스가 나중에 파일을 쓸 수 있다. 결과를 반영하지 않고(정상 응답이어도 error) 재실행·형식 재요청도 하지 않는다.
+    #   running 은 stop_failed 로 남고(_cc_sup_finish), 그룹이 확실히 사라지면 저장된 pre_tree 로 다시 비교한다 (wait.sh)
+    if [ "${_CC_SUP_STOP_FAILED:-0}" = 1 ]; then
+      if [ "$_CC_SUP_TIMED_OUT" = 1 ]; then
+        _cc_sup_finish timeout "$(_cc_sup_timeout_message)"
+      else
+        _cc_sup_finish error "[cc] Codex 프로세스가 모두 끝났는지 확인하지 못해 결과를 반영하지 않았고 다시 시도하지도 않았습니다 (종료 코드 $rc)"
+      fi
       return 0
     fi
     # 시간 상한: 빠른 실패 구간 안이어도 timeout, 재시도 없음 (Ruling R6)
@@ -901,6 +1090,7 @@ cc_cmd_supervise() {
   _CC_SUP_DONE=0; _CC_SUP_CLAIMED=0; _CC_SUP_SIGNAL=""; _CC_SUP_CODEX_PID=""; _CC_SUP_CODEX_IDENT=""; _CC_SUP_FINAL=""
   _CC_SUP_CODEX_RECORDED=0; _CC_SUP_ATTEMPT=1; _CC_SUP_ATTEMPT_SECS=0; _CC_SUP_T0=""; _CC_SUP_TIMED_OUT=0; _CC_SUP_REC=""
   _CC_SUP_NO_START=0; _CC_SUP_STOP_FAILED=0
+  _CC_SUP_EDIT=none; _CC_SUP_PRE_TREE=""; _CC_SUP_POST_TREE=""; _CC_SUP_LC_PRE=""; _CC_SUP_LC_POST=""
   _cc_sup_init_config
   case "$_CC_SUP_ID" in ''|0*|*[!0-9]*) _cc_sup_log "잘못된 호출 번호: ${1:-}"; return 1 ;; esac
   _CC_SUP_ACTIVE=$(cc_active_dir) || { _cc_sup_log "git 저장소를 찾지 못함"; return 1; }

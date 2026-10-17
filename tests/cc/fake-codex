@@ -2,8 +2,8 @@
 # fake-codex - 테스트 전용 가짜 codex. 실제 codex 는 절대 부르지 않는다.
 #
 # 받는 인자 (cc_codex_argv 와 같은 두 형태)
-#   exec --json -s read-only --output-schema <schema> -o <result> -
-#   exec resume --json -c sandbox_mode="read-only" --output-schema <schema> -o <result> <session_id> -
+#   exec --json -s workspace-write --output-schema <schema> -o <result> -
+#   exec resume --json -c sandbox_mode="workspace-write" --output-schema <schema> -o <result> <session_id> -
 #
 # 기록 (n = 이 테스트에서 몇 번째 호출인지, mkdir 로 겹치지 않게 센다)
 #   $FAKE_CODEX_LOG/<n>.argv   인자 한 줄에 하나
@@ -29,6 +29,22 @@
 #   slow          FAKE_CODEX_DELAY 초 동안 1초마다 이벤트를 쓰다가 ok
 #   slow_invalid_json  slow 와 같지만 끝에 -o 에 "not json" 기록 (invalid_json 처럼)
 #   ok_unusable   스키마에는 맞지만 절차가 쓸 수 없는 결과 (verdict plan, 마일스톤 없음, 지시 null) 를 쓰고 exit 0
+#
+# 앞에 붙이는 동작 (R31/R32 수정 감시 시험): 모드가 "<동작>:<모드>" 이면 실행 위치(저장소 루트)에서 그 동작을 한 뒤
+#   <모드> 로 계속한다 (예: edit_tracked:ok, edit_tracked:hang, new_file:ok). 동작 여러 개는 + 로 잇는다
+#   (예: slowsnap+edit_tracked:hang. 모드는 마지막 : 뒤에 하나)
+#   edit_tracked  추적 중인 base.txt 끝에 "codex edit" 한 줄을 더한다
+#   new_file      추적되지도 무시되지도 않는 새 파일 "새 파일.txt" 를 만든다
+#   ignored_only  git 이 무시하는 파일만 쓴다: codex-cache/out.log (테스트가 .gitignore 에 codex-cache/ 를 넣어 둔다)
+#   many_files    추적되지 않는 새 파일 12개 (many/f01.txt … many/f12.txt)
+#   snapfail      저장소는 건드리지 않고 $FAKE_CODEX_LOG/snapfail 표시만 만든다 (테스트의 가짜 git 이 이 표시를 보고
+#                 그 뒤의 작업 트리 스냅샷을 실패시킨다)
+#   slowsnap      저장소는 건드리지 않고 $FAKE_CODEX_LOG/slowsnap 표시만 만든다 (테스트의 가짜 git 이 이 표시를 보고
+#                 그 뒤의 작업 트리 스냅샷을 오래 걸리게 한다)
+#   edit_submodule  하위 모듈 sub 안의 추적 파일 sub/s.txt 끝에 "codex edit" 한 줄을 더한다
+#   late_edit     같은 프로세스 그룹에 자식을 남긴다: FAKE_CODEX_LATE_SECS(기본 3)초 뒤 base.txt 끝에 "late edit" 를 더하고 끝남
+#                 (명령줄 표시 fake-codex-late:<log>, 자식 PID 는 <n>.late)
+#   late_remove_new  late_edit 과 같지만 그 자식이 base.txt 대신 "새 파일.txt" 를 지운다 (new_file 과 함께 써서 최종 트리를 실행 전과 같게)
 
 log="${FAKE_CODEX_LOG:-${TMP:-/tmp}/fake-codex.log}"
 mkdir -p "$log" || exit 70
@@ -65,6 +81,34 @@ done
 
 IFS=, read -r -a seq <<< "${FAKE_CODEX_SEQ:-}"
 mode="${seq[$((n - 1))]:-ok}"
+
+case "$mode" in
+  *:*)
+    actions="${mode%:*}"; mode="${mode##*:}"
+    IFS=+ read -r -a acts <<< "$actions"
+    for action in "${acts[@]}"; do
+    case "$action" in
+      edit_tracked) printf 'codex edit\n' >> base.txt ;;
+      new_file) printf 'codex\n' > "새 파일.txt" ;;
+      ignored_only) mkdir -p codex-cache && printf 'cache\n' > codex-cache/out.log ;;
+      many_files)
+        mkdir -p many
+        for i in 01 02 03 04 05 06 07 08 09 10 11 12; do printf '%s\n' "$i" > "many/f$i.txt"; done ;;
+      snapfail) : > "$log/snapfail" ;;
+      slowsnap) : > "$log/slowsnap" ;;
+      edit_submodule) printf 'codex edit\n' >> sub/s.txt ;;
+      late_edit)
+        perl -e 'sleep $ARGV[0]; open(my $f, ">>", "base.txt") or exit 1; print $f "late edit\n"' \
+          "${FAKE_CODEX_LATE_SECS:-3}" "fake-codex-late:$log" > /dev/null 2>&1 < /dev/null &
+        printf '%s\n' "$!" > "$log/$n.late" ;;
+      late_remove_new)
+        perl -e 'sleep $ARGV[0]; unlink "새 파일.txt"' \
+          "${FAKE_CODEX_LATE_SECS:-3}" "fake-codex-late:$log" > /dev/null 2>&1 < /dev/null &
+        printf '%s\n' "$!" > "$log/$n.late" ;;
+      *) echo "fake-codex: 알 수 없는 동작: $action" >&2; exit 2 ;;
+    esac
+    done ;;
+esac
 
 default_result='{"verdict":"plan","summary":"가짜 계획","plan":{"overview":"가짜 전체 계획","milestones":[{"id":1,"title":"첫 단계","done_criteria":"테스트 통과"},{"id":2,"title":"둘째 단계","done_criteria":"검수 통과"}]},"milestone":1,"instruction":"1번 마일스톤을 구현하세요","findings":[],"question":null}'
 

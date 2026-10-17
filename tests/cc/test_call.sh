@@ -57,11 +57,14 @@ test_plan_call_creates_session_and_applies_plan() {
   assert_file_exists "$CALL1/events.jsonl"
   assert_eq "$(jq -r .verdict "$CALL1/result.json")" "plan"
 }
-test_codex_argv_is_read_only_without_model_overrides() {
+test_codex_argv_is_workspace_write_without_model_overrides() {
+  # R31: Codex 가 테스트를 직접 돌리도록 쓰기 sandbox. 네트워크 설정은 덮어쓰지 않는다 (Codex 기본값 그대로: 막힘)
   start_task; run_cc call plan; wait_until_status_file 1
   printf '%s' "$REVIEW_REPORT" > "$(cc_path report)"; run_cc call review; wait_until_status_file 2
   a1=$(cat "$FAKE_CODEX_LOG/1.argv"); a2=$(cat "$FAKE_CODEX_LOG/2.argv")
-  assert_contains "$a1" "read-only"; assert_contains "$a2" 'sandbox_mode="read-only"'
+  assert_contains "$a1" "workspace-write"; assert_contains "$a2" 'sandbox_mode="workspace-write"'
+  assert_not_contains "$a1$a2" "read-only"
+  assert_not_contains "$a1$a2" "network"
   assert_contains "$a2" "fake-thread-1"
   for a in "$a1" "$a2"; do                     # argv 는 한 줄에 인자 하나
     assert_eq "$(printf '%s\n' "$a" | grep -cx -e '-m' -e '--model')" "0"
@@ -71,8 +74,8 @@ test_codex_argv_is_read_only_without_model_overrides() {
 test_codex_argv_exact_shapes() {
   start_task; run_cc call plan; wait_until_status_file 1
   printf '%s' "$REVIEW_REPORT" > "$(cc_path report)"; run_cc call review; wait_until_status_file 2
-  want1=$(printf '%s\n' exec --json -s read-only --output-schema "$CC_SCHEMA" -o "$ACTIVE/calls/1/result.json" -)
-  want2=$(printf '%s\n' exec resume --json -c 'sandbox_mode="read-only"' --output-schema "$CC_SCHEMA" \
+  want1=$(printf '%s\n' exec --json -s workspace-write --output-schema "$CC_SCHEMA" -o "$ACTIVE/calls/1/result.json" -)
+  want2=$(printf '%s\n' exec resume --json -c 'sandbox_mode="workspace-write"' --output-schema "$CC_SCHEMA" \
     -o "$ACTIVE/calls/2/result.json" fake-thread-1 -)
   assert_eq "$(cat "$FAKE_CODEX_LOG/1.argv")" "$want1"
   assert_eq "$(cat "$FAKE_CODEX_LOG/2.argv")" "$want2"

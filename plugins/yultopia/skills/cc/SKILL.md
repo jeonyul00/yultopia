@@ -1,6 +1,6 @@
 ---
 name: cc
-description: Claude interviews the user into an approved brief, then runs an automatic milestone loop where Codex CLI acts as a read-only PM that plans, reviews the real diff, and approves or rejects.
+description: Claude interviews the user into an approved brief, then runs an automatic milestone loop where Codex CLI acts as the PM that plans, runs the project tests itself, reviews the real diff, and approves or rejects; if Codex changes project files the loop stops.
 disable-model-invocation: true
 argument-hint: "[하고 싶은 것 — 대충 말해도 됨]"
 allowed-tools: Bash(cc-codex.sh:*)
@@ -8,7 +8,7 @@ allowed-tools: Bash(cc-codex.sh:*)
 
 # cc
 
-사용자는 Claude하고만 말한다. Claude가 인터뷰로 요구사항 정리본을 만들어 승인받은 뒤, Codex CLI(읽기 전용 PM)와 마일스톤 단위로 자동으로 주고받는다. Codex는 계획·검수·승인/반려를 맡고, 코드는 Claude만 고친다. 사용자는 진행 줄을 보다가 방향이 틀리면 끊는다.
+사용자는 Claude하고만 말한다. Claude가 인터뷰로 요구사항 정리본을 만들어 승인받은 뒤, Codex CLI(PM)와 마일스톤 단위로 자동으로 주고받는다. Codex는 계획·지시·검수·승인/반려를 책임지고, 검수할 때 프로젝트의 테스트·빌드를 직접 돌려 확인한다(네트워크는 막혀 있음). 코드는 Claude만 고친다. Codex가 프로젝트 파일을 바꾸면(git이 무시하는 캐시·빌드 결과물 제외) 루프가 바로 멈춘다. 사용자는 진행 줄을 보다가 방향이 틀리면 끊는다.
 
 ## 1. 이 세션의 원칙
 
@@ -31,7 +31,7 @@ allowed-tools: Bash(cc-codex.sh:*)
 사용자가 처음 한 말(비어 있을 수 있음): $ARGUMENTS
 
 1. `cc-codex.sh preflight` 를 실행한다. 출력은 JSON 한 줄 `{"ok","code","message","dirty_files","stale_notice","active"}` (0 = 시작 가능, 7 = 시작 불가).
-2. `stale_notice` 가 있으면 어떤 `code` 든 그 한 줄을 먼저 전한다.
+2. `stale_notice` 가 있으면 어떤 `code` 든 그 한 줄을 먼저 전한다. 그 줄에 "Codex가 프로젝트 파일을 바꿨습니다" 나 "작업 트리를 확인하지 못해" 가 있으면 오래된 이전 작업을 지우기 전에 다시 비교해 보니 Codex가 남긴 변경이 있었거나 확인하지 못했다는 뜻이다(기록은 지우지 않았다): 7장의 그 처리(diff 요약, 되돌리지 않았음, 어떻게 할지 묻기)를 먼저 한다.
 3. `code` 별로 처리한다:
 
 | code | 할 일 |
@@ -80,7 +80,7 @@ allowed-tools: Bash(cc-codex.sh:*)
 ## 4. 계획
 
 1. `cc-codex.sh call plan` → 대기 루프(8장).
-2. `verdict` 가 `plan` 이면 `[cc] Codex 계획: 마일스톤 N개 (1 이름 / 2 이름 / …)` 한 줄과 `plan.overview` 한두 줄을 보여주고, **승인 없이** 바로 마일스톤 1의 `instruction` 을 시작한다(5장). `ask_user` 면 계획 전에 Codex가 묻는 것이다: `Codex 질문: <question>` 으로 그대로 묻고 답은 6장 "사용자 말 전달"로 보낸다(계획 요청의 결과는 이 둘뿐이다).
+2. 결과는 먼저 6장 "Codex 답변 보여주기" 대로 보여준다(계획 전체와 1번 지시 포함). `verdict` 가 `plan` 이면 `[cc] Codex 계획: 마일스톤 N개 (1 이름 / 2 이름 / …)` 진행 줄도 쓰고, **승인 없이** 바로 마일스톤 1의 `instruction` 을 시작한다(5장). `ask_user` 면 계획 전에 Codex가 묻는 것이다: `Codex 질문: <question>` 으로 그대로 묻고 답은 6장 "사용자 말 전달"로 보낸다(계획 요청의 결과는 이 둘뿐이다).
 3. 단, 계획이 승인된 정리본의 목표·범위·사용자가 정한 방향을 바꾸면 시작하지 말고, 무엇이 다른지 보여주고 묻는다. 답은 6장 "사용자 말 전달"로 보낸다.
 
 ## 5. 마일스톤 작업
@@ -94,6 +94,7 @@ allowed-tools: Bash(cc-codex.sh:*)
    ```
 
    예: `{ npm test; printf '\nexit=%s\n' "$?"; } 2>&1 | cc-codex.sh put verify m1-test.log`. 출력 줄 끝의 `(exit=N)` 으로 결과를 안다. `(exit=…)` 가 없거나 실패면 `cc-codex.sh path verify` 폴더의 그 파일을 Read 로 읽는다(읽기만).
+   Codex도 검수할 때 같은 명령을 직접 돌려 이 출력과 비교한다. 그래도 Claude가 먼저 돌려 저장한다(Codex가 비교할 기준이고, Codex 쪽은 네트워크가 막혀 있다).
 4. 짧은 보고를 저장한다. diff 본문은 넣지 않는다(Codex가 실제 diff 를 직접 본다):
 
    ```bash
@@ -112,18 +113,30 @@ allowed-tools: Bash(cc-codex.sh:*)
 
 ## 6. Codex 결과 처리
 
-결과 JSON 필드: `verdict`, `summary`, `plan`, `milestone`, `instruction`, `findings`, `question`. 사용자에게는 `summary` 와 필요한 부분만 짧게 전한다. 진행 줄의 `[cc 1/3]` 은 지금 마일스톤 번호/전체 마일스톤 수다.
+결과 JSON 필드: `verdict`, `summary`, `plan`, `milestone`, `instruction`, `findings`, `question`. 진행 줄의 `[cc 1/3]` 은 지금 마일스톤 번호/전체 마일스톤 수다.
 
-**`call review` 의 결과** (마일스톤 검수):
-- `approve`: `[cc 2/3] Codex 승인 → 다음: <이름>` 한 줄 → 정리본과 대조 → 다음 마일스톤(5장). `plan` 이 함께 오면 계획이 바뀐 것: 바뀐 점을 한 줄 보고하고, 목표·범위가 바뀌었으면 멈추고 묻는다.
-- `reject`: `cc-codex.sh status` 의 "연속 반려 R회" 로 R 을 확인하고 `[cc 1/3] Codex 반려 (R/3): <summary>` 한 줄.
+**Codex 답변 보여주기** (`wait` 가 0 으로 결과 JSON 을 줄 때마다. 계획·검수·메시지 답변 모두, `verdict` 가 무엇이든):
+- 한 줄 요약으로 대신하지 말고 **Codex 답변 자체를 사용자에게 보여준다.** Codex가 쓴 내용은 고치거나 줄이거나 바꿔 말하지 않고 그대로 옮긴다. 읽기 쉽게 항목 이름을 붙인 짧은 목록으로 정리하는 것은 괜찮다:
+  - 판정: `verdict` (마일스톤 번호 `milestone` 이 있으면 함께)
+  - 요약: `summary`
+  - 지시: `instruction` 전문 (있을 때)
+  - 지적: `findings` 전부. 항목마다 파일, 줄, 문제(`issue`), 근거(`evidence`)
+  - 질문: `question` (있을 때)
+  - 계획: `plan` 이 있으면 `overview` 와 마일스톤마다 번호·이름·완료 기준
+- 그 아래에 쉬운 한국어 한두 문장으로 이제 무엇을 하는지 설명한다. 예: "Codex가 1번 마일스톤을 승인했습니다. 이제 지시대로 2번을 구현합니다." / "Codex가 반려했습니다. 위 지적 2개를 고친 뒤 다시 검수를 받습니다."
+- 아래의 단계별 진행 줄(`[cc 2/3] Codex 승인 → 다음: …` 등)은 그대로 쓰지만, 진행 줄이 Codex 답변 보여주기를 대신하지 않는다.
+- Codex 이벤트 로그(`events*.jsonl`)나 중간 메시지는 붙여 넣지 않는다. 보여주는 것은 결과 JSON 의 필드뿐이다.
+
+**`call review` 의 결과** (마일스톤 검수. 어느 결과든 먼저 위 "Codex 답변 보여주기"):
+- `approve`: 진행 줄 `[cc 2/3] Codex 승인 → 다음: <이름>` → 정리본과 대조 → 다음 마일스톤(5장). `plan` 이 함께 오면 계획이 바뀐 것: 바뀐 점을 한 줄 보고하고, 목표·범위가 바뀌었으면 멈추고 묻는다.
+- `reject`: `cc-codex.sh status` 의 "연속 반려 R회" 로 R 을 확인하고 진행 줄 `[cc 1/3] Codex 반려 (R/3): <summary>`.
   - R 이 3 미만 → `instruction`·`findings` 를 대조 → 같은 마일스톤을 보완하고 5장 3~5를 다시 한다.
   - R 이 3 이면 보완하지 말고 바로 멈춰 묻는다: 무엇이 반복해서 반려되는지 `findings` 를 요약하고 어떻게 할지. 계속하라면 `cc-codex.sh ack-rejects` → 보완 → 5장 3~5. 방향을 주면 "사용자 말 전달".
 - `done`: 11장.
 - `ask_user`: Codex의 질문임을 밝히고 `Codex 질문: <question>` 으로 그대로 묻는다. 답은 "사용자 말 전달"로 보낸다.
 
-**`call message` 의 결과** (검수가 아니다. 마일스톤은 `call review` 로만 승인·반려된다):
-- `approve`·`reject`·`done`: `[cc 1/3] Codex 답변: <summary>` 한 줄만 보여준다("승인 → 다음"·"반려" 라고 하지 않는다). 정리본과 대조한 뒤 **지금 마일스톤**을 그 `instruction` 대로 이어 간다(지시가 없으면 지금 마일스톤을 마무리한다) → 5장 3~5로 검수를 받는다. `plan` 이 함께 오면 바뀐 점을 한 줄 보고하고, 목표·범위가 바뀌었으면 멈추고 묻는다.
+**`call message` 의 결과** (검수가 아니다. 마일스톤은 `call review` 로만 승인·반려된다. 어느 결과든 먼저 위 "Codex 답변 보여주기"):
+- `approve`·`reject`·`done`: 위 "Codex 답변 보여주기" 를 하고, 진행 줄은 `[cc 1/3] Codex 답변: <summary>` 로 쓴다("승인 → 다음"·"반려" 라고 하지 않는다). 정리본과 대조한 뒤 **지금 마일스톤**을 그 `instruction` 대로 이어 간다(지시가 없으면 지금 마일스톤을 마무리한다) → 5장 3~5로 검수를 받는다. `plan` 이 함께 오면 바뀐 점을 한 줄 보고하고, 목표·범위가 바뀌었으면 멈추고 묻는다.
 - `ask_user`: 위와 같다.
 - `plan`(계획을 처음 내거나 다시 짠 경우): 4장 2~3처럼 처리한다.
 
@@ -163,7 +176,16 @@ allowed-tools: Bash(cc-codex.sh:*)
   - "기록이 깨져 있어": 그대로 전하고 `cc-codex.sh discard` 로 버릴지 묻는다.
   - "끝났는지 확인하지 못해": 이전 호출의 Codex 프로세스가 아직 남아 있을 수 있어 새로 부르지 않았다는 뜻이다. 그 줄을 전하고 `ps -o pid,command -g <pgid>` 로 직접 확인할 수 있다고 알린 뒤 멈춘다. 다시 부르지 않는다(남은 것이 정말 없어지면 다음 `call` 이 그대로 된다).
 - `call` 이 1 이면 그 줄을 전하고 멈춘다. 입력 파일이 없다는 줄이면 `put` 으로 다시 저장하고 한 번만 다시 부른다.
-- `wait` 가 3 이면 그 한 줄(시간 초과, 기술 오류, 형식 오류, 중단 기록 등)을 전하고 멈춘다. 시간 초과는 자동으로 다시 부르지 않는다. 사용자가 다시 하라면 같은 종류로 다시 부른다. 줄에 "끝났는지 확인하지 못했습니다" 가 있으면 Codex 프로세스가 남아 있을 수 있다는 것도 함께 알린다(그 줄의 `ps -o pid,command -g <pgid>` 로 확인).
+- `wait` 가 3 이고 줄에 "Codex가 프로젝트 파일을 바꿨습니다" 가 있으면: Codex 실행 중에 프로젝트 파일(git이 무시하지 않는 파일)이 바뀌어 루프가 멈춘 것이다. 그 호출의 Codex 결과는 반영되지 않았다. **자동으로 이어 가지 않는다.**
+  1. 그 줄을 그대로 보여준다(바뀐 파일 최대 10개와 끝의 `확인: git diff <pre> <post>`).
+  2. 그 줄 끝의 두 값으로 `git diff <pre> <post> --stat` 을 실행해 결과를 보여준다.
+  3. 쉬운 말로 설명한다: 아무것도 되돌리지 않았다(바뀐 파일은 지금 작업 트리에 그대로 있다). Codex가 실행되는 동안 사용자가 직접 고친 파일이 있었다면 그것도 이 목록에 섞여 있을 수 있다.
+  4. 어떻게 할지 묻는다: 바뀐 내용을 그대로 둘지, 사용자가 직접 그 파일들을 되돌릴지. Claude가 알아서 되돌리거나 지우지 않는다. 답을 들은 뒤 사용자 말대로 한다(다시 부르라고 하면 같은 종류로 한 번 다시 부른다).
+  - 줄에 "다시 확인합니다" 가 함께 있으면 Codex 프로세스가 아직 남아 있을 수 있어 목록이 다 나온 것이 아니다. 남은 프로세스가 끝난 뒤 `wait` 를 다시 하면 그때까지 바뀐 파일을 다시 비교한 최종 목록이 나온다고 알린다(나올 때 위 처리를 다시 한다). 줄에 "다시 확인:" 이나 "다시 확인하지 못함:" 이 붙어 있으면 이미 다시 비교를 마친 최종 결과다: 더 기다리지 않는다.
+- `call` 이 6 이고 줄에 "Codex가 프로젝트 파일을 바꿨습니다" 가 있으면: 제대로 끝나지 않았던 이전 Codex 호출을, 새로 부르기 전에 다시 비교해 보니 프로젝트 파일이 바뀌어 있었다는 뜻이다. 새로 부르지 않았다. 바로 위 `wait` 3 의 같은 처리(1~4)를 한다.
+- `wait` 가 3 이거나 `call` 이 6 이고 줄에 "작업 트리를 확인하지 못해" 가 있으면: Codex가 프로젝트 파일을 바꿨는지 확인하지 못한 것이다(그 호출의 Codex 결과는 반영되지 않았다). 그 줄을 보여주고, 줄 끝의 `git diff <pre>` 로 Codex 실행 전과 지금을 비교할 수 있다고(추적 파일만 보인다) 쉽게 설명한 뒤 어떻게 할지 묻는다. 자동으로 이어 가지 않는다.
+- `wait` 가 3 이고 줄에 "결과를 반영하지 않았" 가 있으면: Codex 프로세스가 모두 끝났는지 확인하지 못해 Codex 답변을 쓰지 않은 것이다. 그 줄을 전하고(프로세스 그룹이 적혀 있으면 `ps -o pid,command -g <pgid>` 로 확인할 수 있다고) 멈춘다. 줄에 "다시 확인합니다" 가 있을 때만 남은 프로세스가 끝난 뒤 `wait` 를 다시 하면 파일 변경을 다시 비교한 결과가 나온다(바뀌었으면 위 처리). "다시 확인:" 이 붙은 줄은 최종 결과다: 더 기다리지 않는다.
+- `wait` 가 3 이면 그 한 줄(시간 초과, 기술 오류, 형식 오류, 중단 기록, 작업 트리를 확인하지 못함 등)을 전하고 멈춘다. 시간 초과는 자동으로 다시 부르지 않는다. 사용자가 다시 하라면 같은 종류로 다시 부른다. 줄에 "끝났는지 확인하지 못했습니다" 가 있으면 Codex 프로세스가 남아 있을 수 있다는 것도 함께 알린다(그 줄의 `ps -o pid,command -g <pgid>` 로 확인).
 - 어떤 경우든 active 는 남는다. 나중에 `/yultopia:cc` 로 이어 할 수 있다고 알린다.
 
 ## 8. 대기와 진행 보고
@@ -173,7 +195,7 @@ allowed-tools: Bash(cc-codex.sh:*)
   - exit 0 → 결과 JSON 한 줄 → 6장.
   - exit 2 → 진행 한 줄(`[cc] Codex 실행 중 · 호출 N · 경과 M분 · 마지막 활동 S초 전`)을 사용자에게 그대로 보여주고 다시 `wait`.
   - exit 3 → 7장.
-  - exit 130 → 이 대기가 끊겨 Codex를 멈췄다. 그 줄을 전하고 사용자 말을 기다린다.
+  - exit 130 → 이 대기가 끊겨 Codex를 멈췄다. 그 줄을 전하고 사용자 말을 기다린다. 줄에 "Codex가 프로젝트 파일을 바꿨습니다" 가 있으면 7장의 그 처리(diff 요약, 되돌리지 않았음, 어떻게 할지 묻기)도 한다. 줄에 "작업 트리를 확인하지 못해" 가 있으면 7장의 그 처리도 한다.
 - 단계가 바뀔 때마다 한 줄: `[cc] Codex 계획: 마일스톤 3개 (…)`, `[cc 1/3] Claude 작업 중`, `[cc 1/3] Codex 검수 중`, `[cc 1/3] Codex 반려 (1/3): …`(반려 횟수는 `status` 의 "연속 반려"), `[cc 2/3] Codex 승인 → 다음: …`, `[cc 1/3] Codex 답변: …`(메시지 결과).
 - Claude 자신의 구현이 길어지면 도구 호출 사이사이에 대략 10분마다 한 줄(경과 시간, 지금 하는 일). 사용자가 10분 넘게 소식을 못 듣는 일이 없게 한다.
 - 호출 번호는 재시도 때문에 건너뛸 수 있다(오류 아님). `cc-codex.sh status` 는 단계·호출 수·연속 반려·토큰 한 줄이다. 1(상태를 읽을 수 없음)이면 잠시 뒤 한 번 더 부른다.
@@ -190,6 +212,7 @@ allowed-tools: Bash(cc-codex.sh:*)
 **Codex 멈추기** (사용자가 멈추거나 방향을 바꾸라고 했을 때만. 사용자 말을 Codex에 전하기 전에 한다):
 1. `cc-codex.sh check-orphan --kill` 을 실행한다. 사용자가 시킨 종료라 고아 유예 시간을 기다리지 않는다. 다른 대기 명령이 살아서 기다리는 호출은 멈추지 않는다.
 2. 결과에 따라:
+   - 10 이고 줄에 "Codex가 프로젝트 파일을 바꿨습니다" 가 있으면("종료했습니다" 가 함께 있어도) → Codex는 멈췄지만 그 사이 프로젝트 파일이 바뀌었다. 원래 명령을 다시 하지 말고 7장의 그 처리를 한다. 줄에 "작업 트리를 확인하지 못해" 가 있어도(바뀌었는지 확인하지 못함) 같다: 원래 명령을 다시 하지 말고 7장의 그 처리를 한다.
    - 10 이고 줄이 "종료했습니다" 또는 "이미 끝나 있었습니다" → 멈췄다. 원래 하려던 명령(`call`, `discard`, `finish`)을 한 번만 다시 한다.
    - 0(출력 없음) → 멈출 Codex가 없다. 원래 명령을 한 번만 다시 한다. 그래도 "이미 실행 중"·"Codex가 실행 중입니다" 면 다른 곳(다른 세션 등)의 대기 명령이 기다리는 중이라 멈추지 않았다고 쉽게 알리고 멈춘다.
    - 10 이고 줄이 "확인하지 못해"(안전하게 멈출 수 있는지 확인하지 못함), "KILL 뒤에도"(일부 남음), 또는 "프로세스 그룹 <pgid>"(확인할 수 없는 프로세스) → 그 뜻을 쉬운 말로 전하고(프로세스 그룹이 적혀 있으면 `ps -o pid,command -g <pgid>` 로 직접 확인할 수 있다고) 멈춘다. 다시 시도하지 않는다.
@@ -200,9 +223,10 @@ allowed-tools: Bash(cc-codex.sh:*)
 1. `cc-codex.sh path brief` 로 정리본 위치를 얻어 Read 로 읽는다(읽기만). 이것이 대조 기준이다.
 2. `git status --short` 로 바뀐 파일을 짧게 보여준다(이전 /cc 작업의 변경이므로 깨끗함 검사는 하지 않는다).
 3. 대기 루프로 `cc-codex.sh wait` 를 부르면 단계(`phase`)별로 갈린다:
-   - 0 → 마지막 Codex 결과(working·asking·done 단계). `git diff` 로 이미 한 일을 확인하고 이어서 한다. `approve`·`reject` 는 검수 결과인지 메시지 답변인지 모르므로 메시지 답변처럼 다룬다: 지금 마일스톤(preflight 의 `active.milestone`)을 `instruction` 대로 이어 가고 검수를 받는다. `ask_user` 면 질문을 다시 묻고, `done` 이면 11장, `plan` 이면 4장.
+   - 0 → 마지막 Codex 결과(working·asking·done 단계). 6장 "Codex 답변 보여주기" 대로 그 답변을 다시 보여주고, `git diff` 로 이미 한 일을 확인하고 이어서 한다. `approve`·`reject` 는 검수 결과인지 메시지 답변인지 모르므로 메시지 답변처럼 다룬다: 지금 마일스톤(preflight 의 `active.milestone`)을 `instruction` 대로 이어 가고 검수를 받는다. `ask_user` 면 질문을 다시 묻고, `done` 이면 11장, `plan` 이면 4장.
    - 2 → 아직 실행 중(planning·reviewing 단계). 계속 기다린다.
    - 3 이고 "기다릴 Codex 호출이 없습니다" → 계획 전: `call plan`.
+   - 3 이고 줄에 "Codex가 프로젝트 파일을 바꿨습니다" 가 있으면 → 7장의 그 처리를 한다(자동으로 이어 가지 않는다).
    - 3 그 밖(failed·interrupted 단계) → 그 줄을 전하고 다시 부를지 묻는다. 다시 부르라면 마일스톤이 없으면 `call plan`, 있으면 현재 마일스톤 상태를 확인해 보고를 다시 저장하고 `call review`(사용자 메시지 전달 중이었으면 `call message`).
 
 ## 11. 완료

@@ -152,7 +152,7 @@ EOF
 #   확인할 수 없어 거부되면(2) 아무것도 바꾸지 않는다. 결과 한 줄은 _CC_HK_LINE.
 #   정리하는 동안 INT/TERM/HUP 은 무시한다 (끝 상태를 남기기 전에 끊기지 않도록).
 _cc_hk_kill_orphan() {
-  local st="$_CC_HK_ST" id="$CC_ORPHAN_CALL_ID" pg sid cp cid r=2 final="" i
+  local st="$_CC_HK_ST" id="$CC_ORPHAN_CALL_ID" pg sid cp cid r=2 final="" i note
   pg=$(_cc_jq_get "$st" '.running.pgid // empty | tostring')
   sid=$(_cc_jq_get "$st" '.running.supervisor_identity // empty')
   cp=$(_cc_jq_get "$st" '.running.codex_pid // empty | tostring')
@@ -168,10 +168,14 @@ _cc_hk_kill_orphan() {
         final=$(_cc_wait_settle "$id" interrupted "[cc] 기다리는 대기 명령 없이 실행 중이던 Codex를 종료했습니다 (호출 $id).") && break
         sleep 1
       done
-      if [ -z "$final" ] || [ "$final" = interrupted ]; then
-        _CC_HK_LINE="[cc] 남아 있던 Codex를 종료했습니다"
+      # 감독 프로세스가 마무리하며 Codex 의 프로젝트 파일 수정(codex_modified)이나 확인 실패를 기록했으면 줄 끝에 붙인다 (R32)
+      note=$(_cc_wait_edit_note "$id" "$final")
+      # 이 중단 처리 때문에 감독 프로세스가 수정 감시 결과(codex_modified, 확인 실패 error)를 기록하고 끝난 경우도 "멈춤" 이다
+      if [ -z "$final" ] || [ "$final" = interrupted ] || [ "$final" = codex_modified ] \
+         || { [ "$final" = error ] && [ -n "$note" ]; }; then
+        _CC_HK_LINE="[cc] 남아 있던 Codex를 종료했습니다${note:+ · $note}"
       else
-        _CC_HK_LINE="[cc] Codex 호출 $id 은(는) 종료하기 전에 이미 끝나 있었습니다 ($final)"
+        _CC_HK_LINE="[cc] Codex 호출 $id 은(는) 종료하기 전에 이미 끝나 있었습니다 ($final)${note:+ · $note}"
       fi ;;
     3)
       # 종료를 확인하지 못했다: 끝 상태는 기록하되 프로세스 기록(running)은 남겨 계속 추적한다 (R30)
@@ -372,6 +376,25 @@ _cc_hk_cleanup_stale() {
     none|dead) ;;
     *) _cc_hk_stale_reason; return 0 ;;
   esac
+  # 끝난 기록에 실행 전 트리(running.pre_tree)가 있으면 지우기 전에 최종 다시 비교한다 (Codex 리뷰 3차 2). 정리는 활동이
+  #   아니므로 last_activity_at 은 그대로 둔다. 새로 알게 된 것(Codex 의 파일 수정, 최종 확인 실패)이 있으면 이번에는 지우지
+  #   않고 그 한 줄을 알린다 (preflight 의 stale_notice). 사용자가 부른 cc-codex.sh 에서만 한다: 세션 시작 훅은 스냅샷을 뜨지
+  #   않고 지금처럼 정리한다 (_CC_EDIT_SETTLE_OK)
+  if [ "$_CC_HK_RS" = dead ] && [ "${_CC_EDIT_SETTLE_OK:-0}" = 1 ] && _cc_hk_valid_id "$_CC_HK_ID"; then
+    _CC_WAIT_ACTIVE=$(cc_active_dir)
+    _CC_WAIT_SETTLE_WRITER=_cc_wait_update_keep_activity
+    _cc_edit_settle_dead "$_CC_HK_ID"; r=$?
+    _CC_WAIT_SETTLE_WRITER=_cc_state_update_nolock
+    if [ "$r" -ne 0 ]; then
+      # 최종 비교 결과를 기록하지 못했다: 이번에는 지우지 않는다 (Codex 리뷰 4차 1)
+      _CC_HK_LINE="[cc] 오래된 /cc 기록의 최종 비교 결과를 기록하지 못해 지우지 않았습니다"
+      return 0
+    fi
+    if [ -n "$_CC_EDIT_NEW_LINE" ]; then
+      _CC_HK_LINE=$_CC_EDIT_NEW_LINE
+      return 0
+    fi
+  fi
   _cc_hk_delete_if_idle "$limit"; r=$?
   case "$r" in
     0) _CC_HK_LINE="[cc] 오래된 /cc 중단 기록을 정리했습니다" ;;

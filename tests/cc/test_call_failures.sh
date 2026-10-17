@@ -139,7 +139,7 @@ test_invalid_json_requests_format_once() {
   wait_until_status_file 1 || _fail "status 파일이 생기지 않음"
   assert_eq "$(cat "$CALL1/status")" "ok"
   assert_eq "$(cf_invocations)" "2"
-  want=$(printf '%s\n' exec resume --json -c 'sandbox_mode="read-only"' --output-schema "$CF_SCHEMA" \
+  want=$(printf '%s\n' exec resume --json -c 'sandbox_mode="workspace-write"' --output-schema "$CF_SCHEMA" \
     -o "$CALL1/result.json" fake-thread-1 -)
   assert_eq "$(cat "$FAKE_CODEX_LOG/2.argv")" "$want"
   cf_want_format_retry plan && cmp -s "$FAKE_CODEX_LOG/2.stdin" "$TMP/want-retry.md" || _fail "2회차 stdin 이 이유를 넣은 pm-format-retry.md 와 다름"
@@ -381,6 +381,7 @@ test_call_refuses_when_dead_supervisor_group_still_has_members() {
 cf_slow_exec_codex() { sleep 11; exec perl "$TMP/cf-wait-recorded.pl" "slow-exec-codex:$TMP"; }
 test_codex_identity_recorded_even_when_exec_is_late() {
   start_task
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/snapshot.sh"   # 감독 프로세스는 codex 실행 전후 작업 트리를 뜬다 (R31/R32)
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/render.sh"
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
   printf '%s\n' 'my $f = $ENV{CF_STATE_FILE};' \
@@ -441,6 +442,7 @@ test_concurrent_calls_start_exactly_one() {
 # ---- Task 7 addendum C: 그룹 정리를 할 수 없을 때도 TERM 을 무시하는 codex 를 KILL 까지 한다 ----
 test_timeout_fallback_kills_term_ignoring_codex() {
   FAKE_CODEX_SEQ=hang_stubborn; start_task
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/snapshot.sh"   # 감독 프로세스는 codex 실행 전후 작업 트리를 뜬다 (R31/R32)
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/render.sh"
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
   # 테스트 전용 대역: 그룹 정리가 거부된 상황(ps 실패 등)을 만든다. 이 테스트 셸 안에서만 바뀐다
@@ -479,6 +481,7 @@ test_argv_build_failure_is_not_retried() {
 # ---- 최종 리뷰 minor d: 감독 프로세스는 call_id 뿐 아니라 pgid 까지 자기 것인 running 만 고친다 ----
 #   (오래된 감독 프로세스가 같은 호출 번호를 쓰는 새 작업의 state 에 쓰지 않도록)
 cf_source_call() {
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/snapshot.sh"   # 감독 프로세스는 codex 실행 전후 작업 트리를 뜬다 (R31/R32)
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/render.sh"
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
 }
@@ -608,6 +611,7 @@ test_timeout_keeps_process_record_when_group_cleanup_is_unconfirmed() {
   assert_eq "$(state .phase)" "failed"
   assert_contains "$(state .last_call.message)" "시간 초과"
   assert_contains "$(state .last_call.message)" "ps -o pid,command -g $pg"
+  assert_contains "$(state .last_call.message)" "다시 확인"      # Codex 리뷰 1차 2: 파일 변경 확인은 끝난 뒤 다시
   assert_eq "$(cf_lines "$(state .last_call.message)")" "1"
   # 프로세스 기록은 남긴다
   assert_eq "$(state .running.call_id)" "1"; assert_eq "$(state .running.pgid)" "$pg"
@@ -639,6 +643,7 @@ test_timeout_keeps_process_record_when_group_cleanup_is_unconfirmed() {
   run_cc check-orphan; assert_code 0
   assert_eq "$(state .running)" "null"
   assert_eq "$(state .last_call.status)" "timeout"; assert_eq "$(state .phase)" "failed"
+  assert_contains "$(state .last_call.message)" "바뀐 프로젝트 파일 없음"
   assert_eq "$(cat "$CALL1/status")" "timeout"
   run_cc call plan; assert_code 0
   wait_until_status_file 2 || _fail "다음 호출이 끝나지 않음"
@@ -671,7 +676,8 @@ test_supervisor_keeps_process_record_when_stop_is_not_confirmed() {
         if [ "$how" = timeout ]; then FAKE_CODEX_SEQ=hang; CC_CALL_TIMEOUT_SECS=1; else FAKE_CODEX_SEQ=ok; fi
         start_task "sup-$how-$rc"; cf_source_call
         cf_sup_standin_run "$rc" "$how"
-        want=ok; [ "$how" = timeout ] && want=timeout
+        # Codex 리뷰 1차 (R32) 2: 그룹이 비었는지 확인하지 못하면 결과를 반영하지 않는다 (정상 응답이어도 error)
+        want=error; [ "$how" = timeout ] && want=timeout
         assert_eq "$(cat "$CALL1/status" 2>/dev/null)" "$want" "$how/$rc status 파일"
         assert_eq "$(state .last_call.status)" "$want" "$how/$rc last_call"
         assert_eq "$(state .last_call.call_id)" "1"
@@ -680,22 +686,40 @@ test_supervisor_keeps_process_record_when_stop_is_not_confirmed() {
         assert_eq "$(state .running.call_id)" "1" "$how/$rc running 이 지워짐"
         assert_eq "$(state .running.pgid)" "$$"
         assert_eq "$(state .running.stop_failed)" "true"
-        if [ "$how" = normal ]; then
-          assert_eq "$(state .last_call.verdict)" "plan"
-          assert_eq "$(state .phase)" "working"; assert_eq "$(state .milestone)" "1"
-        else
-          assert_eq "$(state .phase)" "failed"
-        fi
+        assert_eq "$(state .last_call.verdict)" "null" "$how/$rc verdict"
+        assert_eq "$(state .phase)" "failed" "$how/$rc phase"; assert_eq "$(state .milestone)" "null" "$how/$rc milestone"
+        [ -n "$(state '.running.pre_tree // empty')" ] || _fail "$how/$rc: running.pre_tree 가 없음"
+        assert_contains "$(state .last_call.message)" "다시 확인"
+        [ "$how" = normal ] && assert_contains "$(state .last_call.message)" "결과를 반영하지 않았"
         grep -q '반영하지 못함' "$TMP/sup-$how-$rc.log" && _fail "$how/$rc: 결과 반영을 되풀이함"
         # wait 는 기록된 결과를 곧바로 돌려준다
-        if [ "$how" = normal ]; then run_cc wait --max 5; assert_code 0; assert_eq "$(jq -r .verdict <<<"$OUT")" "plan"
-        else run_cc wait --max 5; assert_code 3; assert_contains "$OUT" "시간 초과"; fi
-        # 이 대역 기록은 확인상 끝난 것(dead)이다: 정리할 때 running 만 지우고 끝 상태는 그대로 둔다
+        run_cc wait --max 5; assert_code 3; assert_eq "$OUT" "$(state .last_call.message)"
+        [ "$how" = timeout ] && assert_contains "$OUT" "시간 초과"
+        # 이 대역 기록은 확인상 끝난 것(dead)이다: 정리할 때 저장된 pre 로 다시 비교하고(바뀐 것 없음) running 을 지운다.
+        #   끝 상태는 그대로 둔다
         run_cc check-orphan; assert_code 0
         assert_eq "$(state .running)" "null"
         assert_eq "$(state .last_call.status)" "$want" "$how/$rc 정리 뒤 끝 상태"
+        assert_contains "$(state .last_call.message)" "바뀐 프로젝트 파일 없음"
       )
     done
   done
   return 0
+}
+
+# ---- Codex 리뷰 1차 (R32) 3: 실행 전 트리를 running 에 남기지 못하면 codex 를 실행하지 않는다 ----
+test_codex_not_started_when_pre_tree_cannot_be_recorded() {
+  start_task; cf_source_call
+  # running 이 이 감독 프로세스(이 테스트 셸, pgid=$$)를 가리키지 않으면 기록할 수 없다
+  set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $(( $$ + 100000 )), supervisor_identity: \"x|y\",
+    codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
+  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_ATTEMPT=1
+  mkdir -p "$_CC_SUP_DIR"; printf '프롬프트\n' > "$_CC_SUP_DIR/prompt.md"
+  _cc_sup_init_config
+  _cc_sup_run_codex exec - "$_CC_SUP_DIR/prompt.md" >> "$TMP/sup.log" 2>&1; rc=$?
+  assert_eq "$rc" "125"
+  assert_eq "$_CC_SUP_NO_START" "1"
+  assert_eq "$(cf_invocations)" "0"
+  assert_eq "$(state '.running.pre_tree // "none"')" "none"
+  grep -q '기록하지 못함' "$TMP/sup.log" || _fail "기록 실패 로그가 없음"
 }

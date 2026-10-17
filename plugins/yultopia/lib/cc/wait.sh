@@ -5,9 +5,11 @@
 # 출력 (stdout 은 언제나 한 줄. Codex 이벤트 로그·중간 메시지는 절대 내보내지 않는다)
 #   끝남 ok              → result.json 을 jq -c 한 줄, 0
 #   끝남 timeout         → last_call.message (없으면 설정값으로 "[cc] Codex 시간 초과(20분) — 자동 재시도하지 않았습니다"), 3
+#   끝남 codex_modified  → last_call.message (Codex 실행 중에 바뀐 파일과 확인 명령. R32), 3
 #   끝남 그 밖(error, invalid_json, interrupted …) → last_call.message, 3
 #   --max 초 안에 안 끝남 → "[cc] Codex 실행 중 · 호출 N · 경과 M분 · 마지막 활동 S초 전", 2
-#   이 wait 가 INT/TERM/HUP 을 받음 → "[cc] 중단됨: Codex 종료" 등 한 줄, 130 (아래 "중단 처리")
+#   이 wait 가 INT/TERM/HUP 을 받음 → "[cc] 중단됨: Codex 종료" 등 한 줄, 130 (아래 "중단 처리").
+#     감독 프로세스가 마무리하며 Codex 의 프로젝트 파일 수정을 찾았으면 "… · Codex가 프로젝트 파일을 바꿨습니다…" 를 붙인다
 #     130 은 이 wait 자신이 신호를 받았을 때만이다 (Ruling R19). 앞서 기록된 interrupted 나, 이 wait 가 찾아낸
 #     "기록 없이 죽은 호출" 을 state 에서 읽어 알릴 때는 3.
 #   실행 중인 호출도 끝난 호출도 없음 → "[cc] 기다릴 Codex 호출이 없습니다", 3
@@ -182,13 +184,62 @@ _cc_wait_heartbeat() {
     || cc_err "[cc] 대기자 확인 시각을 기록하지 못했습니다"
 }
 
+# ---- 끝 상태 없이 끝난 호출의 파일 수정 다시 비교 (R32, Codex 리뷰 1차 2·3) ----
+# 감독 프로세스는 codex 를 띄우기 전에 그 시도의 실행 전 트리를 running.pre_tree 로 남긴다 (call.sh _cc_sup_record_pre).
+# 그 기록이 남은 채로 호출이 끝났는데(감독 프로세스가 기록 없이 죽음, 또는 종료를 확인하지 못한 stop_failed 기록) 그룹이
+# 확실히 사라진 것을 확인한 쪽(wait·check-orphan·preflight·call)은 running 을 지우기 전에 지금 작업 트리를 떠서 다시 비교한다:
+#   바뀜 → codex_modified (메시지·pre/post_tree, phase failed, verdict null)
+#   스냅샷 실패 → error (원래 메시지 + 확인 실패 문구, phase failed, verdict null)
+#   같음 → 끝 상태 그대로 (stop_failed 기록이면 "다시 확인: 바뀐 프로젝트 파일 없음" 을 붙인다)
+#   이미 codex_modified 로 기록된 stop_failed 기록(첫 비교에서 바뀐 것을 찾았지만 종료를 확인하지 못함)도 다시 비교한다
+#   (Codex 리뷰 2차): 최종 트리가 다르면 post_tree·메시지를 최종 값으로 고치고, 같거나 스냅샷이 실패해도 앞서 찾은 증거는
+#   지우지 않고 그 사실을 메시지 한 줄에 덧붙인다. 스냅샷은 state 잠금 밖에서 뜬다.
+# 훅(메시지마다·세션 시작)은 빨라야 하므로 스냅샷을 뜨지 않는다: cc-codex.sh 가 _CC_EDIT_SETTLE_OK=1 로 둔 실행에서만 하고,
+#   그 밖에서 다시 비교가 필요한 기록을 만나면 정리하지 않고 그대로 둔다 (다음 wait·check-orphan·preflight·call 이 한다).
+
+# _cc_edit_recheck_prepare <id> : _CC_EF = none(필요 없음) | skip(필요하지만 여기서는 안 함) | same | modified | unknown,
+#   _CC_EF_PRE / _CC_EF_POST / _CC_EF_MSG (modified: 그 한 줄, unknown: 확인 실패 문구)
+_cc_edit_recheck_prepare() {
+  local id="$1" pre post lpre lpost
+  _CC_EF=none; _CC_EF_PRE=""; _CC_EF_POST=""; _CC_EF_MSG=""; _CC_EF_BASE=""
+  # 이미 codex_modified 로 기록된 stop_failed 기록도 다시 비교한다: 첫 비교 뒤에 남은 프로세스가 더 바꿨을 수 있다
+  #   (Codex 리뷰 2차). 최종 결과로 post_tree·메시지를 고치되 앞서 찾은 증거는 지우지 않는다 (아래 recheck)
+  pre=$(jq -r --argjson id "$id" '
+      if (.running | type) == "object" and .running.call_id == $id
+         and (.running.pre_tree | type) == "string" and (.running.pre_tree | test("^[0-9a-f]{40,64}$"))
+      then .running.pre_tree else empty end' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+  [ -n "$pre" ] || return 0
+  if [ "${_CC_EDIT_SETTLE_OK:-0}" != 1 ]; then _CC_EF=skip; return 0; fi
+  _CC_EF_PRE=$pre
+  # 이미 codex_modified 로 기록된 호출이면 저장된 pre_tree/post_tree 로 증거 한 줄을 다시 만든다 (Codex 리뷰 3차 1:
+  #   최종 결과를 붙일 때 처음 줄의 "다시 확인합니다"·종료 미확인 경고·ps 안내를 남기지 않도록)
+  { IFS= read -r lpre; IFS= read -r lpost; } <<EOF
+$(jq -r --argjson id "$id" '
+    if (.last_call | type) == "object" and .last_call.call_id == $id and .last_call.status == "codex_modified"
+       and (.last_call.pre_tree | type) == "string" and (.last_call.post_tree | type) == "string"
+    then .last_call.pre_tree, .last_call.post_tree else empty end' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+EOF
+  [ -n "$lpre" ] && [ -n "$lpost" ] && _CC_EF_BASE=$(_cc_edit_modified_message "$lpre" "$lpost")
+  post=$(cc_snapshot_tree) || post=""
+  if [ -z "$post" ]; then
+    _CC_EF=unknown; _CC_EF_MSG=$(_cc_edit_uncheck_note "$pre")
+  elif [ "$post" = "$pre" ]; then
+    _CC_EF=same; _CC_EF_POST=$post
+  else
+    _CC_EF=modified; _CC_EF_POST=$post; _CC_EF_MSG=$(_cc_edit_modified_message "$pre" "$post")
+  fi
+}
+
 # _cc_wait_settle <id> [<status> <message> [keep]] : 잠금 안에서 호출 <id> 의 끝 상태를 정리한다.
 #   - status 를 주면 running 이 아직 이 호출일 때만 바꾼다. 감독 프로세스가 먼저 끝 상태를 기록했으면 그것을 따른다.
 #       keep 없음 = 그 호출의 프로세스가 사라진 것을 확인함 (검증된 종료 0, 또는 dead):
 #         끝 상태가 없으면 그 값으로 끝낸다 (running=null, last_call, phase).
 #         이미 끝 상태가 기록된 stop_failed 기록이면 running 만 지운다 (끝 상태·메시지는 그대로, R30).
+#         어느 쪽이든 running.pre_tree 가 있으면 지우기 전에 파일 수정을 다시 비교해 반영한다 (위 설명. 훅에서는 하지 않고
+#         이 기록을 그대로 둔다).
 #       keep = 종료를 확인하지 못함 (KILL 뒤에도 남음 3, R30): 끝 상태가 없으면 그 값으로 기록하되 running 은 지우지 않고
 #         stop_failed 로 표시한다 (pgid·신원 그대로 → 훅·고아 확인·preflight·버리기·정리가 계속 본다). 이미 stop_failed 면 그대로.
+#         파일 수정 비교는 그룹이 사라진 뒤로 미룬다.
 #   - 그 뒤 state 가 이 호출에 기록한 status 를 읽어, status 파일이 없거나 다르면 그 값으로 쓴다 (status 파일 == state).
 #   stdout: state 가 기록한 이 호출의 status, 0. 아직 끝 상태 없이 실행 중으로 기록돼 있거나 기록이 없거나 잠금 실패면 출력 없이 1
 # 끝 상태를 쓰는 함수. 기본은 last_activity_at 을 지금으로 바꾼다. 죽은 기록 정리(housekeeping 의 _cc_hk_running_state)만
@@ -197,19 +248,65 @@ _CC_WAIT_SETTLE_WRITER=_cc_state_update_nolock
 _cc_wait_settle() {
   local id="$1" st="${2:-}" msg="${3:-}" keep=0 final dir cur rc=1
   [ "${4:-}" = keep ] && keep=1
+  _CC_EF=none; _CC_EF_PRE=""; _CC_EF_POST=""; _CC_EF_MSG=""; _CC_EF_BASE=""
+  [ -n "$st" ] && [ "$keep" = 0 ] && _cc_edit_recheck_prepare "$id"
   cc_state_lock || return 1
-  if [ -n "$st" ]; then
+  if [ -n "$st" ] && [ "$_CC_EF" != skip ]; then
     $_CC_WAIT_SETTLE_WRITER '
+      def note($t): .last_call.message = ((.last_call.message // "[cc] Codex 호출이 끝났습니다") + " · " + $t);
+      # 그룹이 사라진 것을 확인했으므로 감독 프로세스가 붙인 앞으로의 안내(다시 확인합니다)·종료 미확인 경고·ps 안내를
+      #   지운다 (Codex 리뷰 3차 1). 대기 명령이 붙인 "KILL 뒤에도 남아 있습니다" 같은 지난 사실은 그대로 둔다
+      #   처음 실행 뒤 스냅샷이 실패했다는 문구도 지운다: 이번 최종 비교의 결과(같음·바뀜·다시 실패)만 남긴다. 다시 실패하면
+      #   recheck 가 확인 실패를 정확히 한 번 붙인다 (Codex 리뷰 4차 2)
+      def clean:
+        if (.last_call | type) == "object" and .last_call.call_id == $id and (.last_call.message | type) == "string" then
+          .last_call.message |= (gsub("(: | · )실행 뒤 작업 트리를 확인하지 못해 Codex가 프로젝트 파일을 바꿨는지 알 수 없습니다 \\(확인: git diff [0-9a-f]+\\)"; "")
+            | sub("^\\[cc\\] 실행 뒤 작업 트리를 확인하지 못해 Codex가 프로젝트 파일을 바꿨는지 알 수 없습니다 \\(확인: git diff [0-9a-f]+\\)";
+                  "[cc] Codex 호출이 끝났습니다")
+            | gsub(" · 프로젝트 파일 변경은 남은 Codex 프로세스가 끝난 뒤 다시 확인합니다"; "")
+            | gsub(" · 일부 Codex 프로세스가 끝났는지 확인하지 못했습니다 \\(프로세스 그룹 [0-9]+\\. 확인: ps -o pid,command -g [0-9]+\\)"; "")
+            | sub("^\\[cc\\] Codex 호출은 끝났지만 일부 Codex 프로세스가 끝났는지 확인하지 못했습니다 \\(프로세스 그룹 [0-9]+\\. 확인: ps -o pid,command -g [0-9]+\\)$";
+                  "[cc] Codex 호출이 끝났습니다"))
+        else . end;
+      def recheck:
+        if (.running.pre_tree // "") != $efpre or $efpre == ""
+           or (.last_call | type) != "object" or .last_call.call_id != $id then .
+        elif .last_call.status == "codex_modified" then
+          # 첫 비교에서 이미 바뀐 것을 찾은 기록 (종료를 확인하지 못해 남겨 둔 것): 증거(상태·pre/post·파일)는 지우지 않는다.
+          #   최종 트리가 기록과 다르면 post_tree 와 메시지를 최종 값으로 고친다 (남은 프로세스의 나중 변경까지).
+          #   그 밖에는 저장된 pre/post 로 다시 만든 증거 한 줄($efbase)에 최종 결과만 붙인다 (Codex 리뷰 3차 1)
+          (if $efbase != "" then .last_call.message = $efbase else . end) as $b
+          | if $ef == "modified" and (.last_call.post_tree // "") != $efpost then
+              .last_call = (.last_call + {message: ($efmsg + " (남은 Codex 프로세스가 끝난 뒤 다시 확인한 최종 결과)"),
+                                          pre_tree: $efpre, post_tree: $efpost, verdict: null})
+            elif $ef == "modified" then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인: 추가로 바뀐 파일 없음")
+            elif $ef == "same" then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인: 지금 작업 트리는 실행 전과 같음 (앞서 찾은 변경 기록은 그대로 둠)")
+            elif $ef == "unknown" then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인하지 못함: " + $efmsg)
+            else . end
+          | .phase = "failed"
+        elif $ef == "modified" then
+          .last_call = (.last_call + {status: "codex_modified", verdict: null, message: $efmsg,
+                                      pre_tree: $efpre, post_tree: $efpost})
+          | .phase = "failed"
+        elif $ef == "unknown" then
+          .last_call = (.last_call + {status: "error", verdict: null, pre_tree: $efpre,
+                                      message: ((if (.last_call.message | type) == "string" and .last_call.message != ""
+                                                 then .last_call.message + " · " else "[cc] " end) + $efmsg)})
+          | .phase = "failed"
+        elif $ef == "same" and .running.stop_failed == true then
+          note("남은 Codex 프로세스가 끝난 뒤 다시 확인: 바뀐 프로젝트 파일 없음")
+        else . end;
       if (.running | type) == "object" and .running.call_id == $id then
         if .running.stop_failed == true then
-          (if $keep == 1 then . else .running = null end)
+          (if $keep == 1 then . else clean | recheck | .running = null end)
         else
           .last_call = {call_id: $id, kind: .running.kind, status: $st, verdict: null,
                         message: (if $msg == "" then null else $msg end)}
           | .phase = (if $st == "interrupted" then "interrupted" else "failed" end)
-          | (if $keep == 1 then .running.stop_failed = true else .running = null end)
+          | (if $keep == 1 then .running.stop_failed = true else recheck | .running = null end)
         end
       else . end' --argjson id "$id" --arg st "$st" --arg msg "$msg" --argjson keep "$keep" \
+        --arg ef "$_CC_EF" --arg efpre "$_CC_EF_PRE" --arg efpost "$_CC_EF_POST" --arg efmsg "$_CC_EF_MSG" --arg efbase "${_CC_EF_BASE:-}" \
       || cc_err "[cc] 호출 $id 의 끝 상태를 기록하지 못했습니다"
   fi
   final=$(jq -r --argjson id "$id" '
@@ -234,6 +331,47 @@ _cc_wait_settle() {
   return "$rc"
 }
 
+# _CC_EDIT_FLAG_FILTER : 이 호출의 last_call 이 알릴 것(codex_modified 또는 확인 실패)이면 "상태|post_tree|확인 실패 여부" 한 줄
+#   (아니면 빈 출력). 정리 전후를 이 값으로 비교한다: 메시지에 "추가로 바뀐 파일 없음" 같은 최종 결과가 붙기만 했으면
+#   새로 알릴 것이 아니다 (Codex 리뷰 2차). jq 인자 $id, $mark
+_CC_EDIT_FLAG_FILTER='
+  if (.last_call | type) == "object" and .last_call.call_id == $id
+     and (.last_call.status == "codex_modified"
+          or ((.last_call.message | type) == "string" and (.last_call.message | contains($mark))))
+  then "\(.last_call.status)|\(.last_call.post_tree // "")|\((.last_call.message // "") | contains($mark))" else empty end'
+
+# _cc_edit_settle_dead <id> : 확실히 끝난(dead) 호출 <id> 의 기록에 running.pre_tree 가 있으면 정리하며 다시 비교한다
+#   (_cc_wait_settle. 끝 상태가 없으면 interrupted 로). 이번 정리로 새로 알게 된 것(codex_modified 를 새로 찾음, post_tree 가
+#   최종 값으로 바뀜, 최종 확인 실패)이 있으면 _CC_EDIT_NEW_LINE 에 그 호출의 한 줄 (없으면 빈 값). _CC_WAIT_ACTIVE 를
+#   정해 두고 부른다. 쓰는 함수는 _CC_WAIT_SETTLE_WRITER 그대로 (14일 정리는 last_activity_at 을 유지하는 것으로 바꿔 부른다).
+#   다음 call 전(call.sh)과 14일 자동 정리 전(housekeeping.sh, Codex 리뷰 3차 2)에 쓴다.
+#   0 = 정리했다 (새로 알릴 것이 있으면 _CC_EDIT_NEW_LINE) 또는 다시 비교할 기록이 아니다
+#   2 = 정리·기록에 실패했다 (잠금을 못 잡음, state 쓰기 실패, 이 실행에서 다시 비교할 수 없음 등으로 running 에 이 호출이
+#       그대로 남음, Codex 리뷰 4차 1). 호출한 쪽은 이 기록을 덮어쓰거나(새 call) 지우면(자동 정리) 안 된다
+_cc_edit_settle_dead() {
+  local id="$1" before after rc left
+  _CC_EDIT_NEW_LINE=""
+  [ "$(jq -r --argjson id "$id" '(.running | type) == "object" and .running.call_id == $id
+                                 and (.running.pre_tree | type) == "string"' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)" = true ] \
+    || return 0
+  before=$(jq -r --argjson id "$id" --arg mark "$_CC_WAIT_UNCHECK_MARK" "$_CC_EDIT_FLAG_FILTER" "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+  _cc_wait_settle "$id" interrupted \
+    "[cc] Codex 감독 프로세스가 결과를 남기지 않고 끝나 호출 $id 을(를) 중단됨으로 기록했습니다." >/dev/null
+  rc=$?
+  # 정리가 성공했고 state 에서 이 호출의 running 이 실제로 없어졌는지 확인한다 (읽을 수 없으면 남은 것으로 본다)
+  left=$(jq -r --argjson id "$id" '(.running | type) == "object" and .running.call_id == $id' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+  if [ "$rc" -ne 0 ] || [ "$left" != false ]; then
+    cc_err "[cc] 호출 $id 의 최종 비교 결과를 state 에 기록하지 못했습니다"
+    return 2
+  fi
+  after=$(jq -r --argjson id "$id" --arg mark "$_CC_WAIT_UNCHECK_MARK" \
+            "if (.running | type) == \"object\" and .running.call_id == \$id then empty else ($_CC_EDIT_FLAG_FILTER) end" \
+            "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+  [ -n "$after" ] && [ "$after" != "$before" ] || return 0
+  _CC_EDIT_NEW_LINE=$(jq -r '.last_call.message // "[cc] Codex가 프로젝트 파일을 바꿨습니다(되돌리지 않음)" | gsub("\\p{Cc}+"; " ")' \
+                        "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+}
+
 # _cc_wait_report <id> <status> : 끝난 호출의 결과 한 줄과 종료 코드를 _CC_WAIT_LINE / _CC_WAIT_CODE 에 둔다
 _cc_wait_report() {
   local id="$1" st="$2" msg json
@@ -254,6 +392,10 @@ _cc_wait_report() {
     timeout)
       [ -n "$msg" ] || msg=$(_cc_sup_timeout_message "$(_cc_sup_uint "${CC_CALL_TIMEOUT_SECS:-}" 1200)")
       _CC_WAIT_LINE=$msg; _CC_WAIT_CODE=3 ;;
+    codex_modified)
+      # Codex 실행 중에 프로젝트 파일이 바뀌어 멈춘 호출 (R32): 바뀐 파일·확인 명령을 담은 그 한 줄, 3
+      [ -n "$msg" ] || msg="[cc] Codex가 프로젝트 파일을 바꿨습니다(되돌리지 않음) (호출 $id)."
+      _CC_WAIT_LINE=$msg; _CC_WAIT_CODE=3 ;;
     *)
       [ -n "$msg" ] || msg="[cc] Codex 호출이 실패했습니다 (호출 $id, 상태 $st)."
       _CC_WAIT_LINE=$msg; _CC_WAIT_CODE=3 ;;
@@ -262,7 +404,16 @@ _cc_wait_report() {
 
 # _cc_wait_conclude <id> : 끝난 호출을 정리(status 파일 맞추기)하고 결과를 알린다
 _cc_wait_conclude() {
-  local id="$1" final
+  local id="$1" final st
+  # 종료를 확인하지 못했던 기록(stop_failed)이 이제 확실히 끝났으면(dead) 정리한다: 지우기 전에 저장된 pre_tree 로
+  #   파일 수정을 다시 비교한다 (Codex 리뷰 1차 2). 아직 남아 있거나 판단할 수 없으면 기록된 결과만 알린다
+  st=$(_cc_wait_read_state)
+  if [ -n "$st" ] \
+     && [ "$(printf '%s' "$st" | jq -r --argjson id "$id" \
+            '(.running | type) == "object" and .running.call_id == $id and .running.stop_failed == true' 2>/dev/null)" = true ] \
+     && ! _cc_call_is_running "$st"; then
+    _cc_wait_settle "$id" interrupted "" >/dev/null
+  fi
   final=$(_cc_wait_settle "$id")
   if [ -z "$final" ]; then
     # state 에서 이 호출의 끝 기록을 읽지 못했다 (잠금 실패 등): status 파일이라도 본다
@@ -393,23 +544,47 @@ _cc_wait_interrupt() {
   _cc_wait_interrupt_conclude "$id" "$r"
 }
 
+# _cc_wait_edit_note <id> <final> : 중단 처리 결과 줄에 붙일 프로젝트 파일 수정 감시 결과 (R32). 없으면 빈 출력.
+#   감독 프로세스는 중단 신호로 끝날 때도 실행 전후 작업 트리를 비교해 기록한다 (call.sh _cc_sup_on_exit):
+#   - codex_modified → 그 메시지(바뀐 파일·확인 명령)에서 앞의 "[cc] " 를 뗀 것 (메시지가 없으면 고정 문구)
+#   - 메시지에 실행 뒤 작업 트리 확인 실패가 적혀 있으면 → 그 부분
+#   check-orphan --kill (housekeeping.sh) 도 쓴다. _CC_WAIT_ACTIVE 가 정해져 있어야 한다.
+_CC_WAIT_UNCHECK_MARK="실행 뒤 작업 트리를 확인하지 못해"
+_cc_wait_edit_note() {
+  local id="$1" final="$2" note
+  note=$(jq -r --argjson id "$id" --arg st "$final" --arg mark "$_CC_WAIT_UNCHECK_MARK" '
+      if (.last_call | type) == "object" and .last_call.call_id == $id then
+        (.last_call.message | if type == "string" then gsub("\\p{Cc}+"; " ") else "" end) as $m
+        | if $st == "codex_modified" then ($m | sub("^\\[cc\\] "; ""))
+          elif ($m | contains($mark)) then $mark + ($m | split($mark) | .[1:] | join($mark))
+          else empty end
+      else empty end' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+  [ -z "$note" ] && [ "$final" = codex_modified ] && note="Codex가 프로젝트 파일을 바꿨습니다(되돌리지 않음)"
+  printf '%s' "$note"
+}
+
 # _cc_wait_interrupt_conclude <id> <0|3|2|done> : 중단 처리 결과를 state·status 파일에 맞추고 알릴 한 줄을 정한다
 #   0 끝냈음 / 3 KILL 뒤에도 남음 / done 신호 전에 이미 끝나 있었음 / 그 밖(2) 확인할 수 없어 아무것도 바꾸지 않음
+#   감독 프로세스가 마무리하며 Codex 의 프로젝트 파일 수정(codex_modified)이나 확인 실패를 기록했으면 줄 끝에 붙인다 (R32)
 _cc_wait_interrupt_conclude() {
-  local id="$1" r="$2" final="" i
+  local id="$1" r="$2" final="" i note
   case "$r" in
     done)
       final=$(_cc_wait_settle "$id")
-      _CC_WAIT_LINE="[cc] 중단됨: Codex 호출 $id 은(는) 중단 전에 이미 끝나 있었습니다 (${final:-결과 확인 불가})" ;;
+      note=$(_cc_wait_edit_note "$id" "$final")
+      _CC_WAIT_LINE="[cc] 중단됨: Codex 호출 $id 은(는) 중단 전에 이미 끝나 있었습니다 (${final:-결과 확인 불가})${note:+ · $note}" ;;
     0)
       for i in 1 2 3; do
         final=$(_cc_wait_settle "$id" interrupted "$_CC_WAIT_INTERRUPTED_LINE") && break
         sleep 1
       done
-      if [ -z "$final" ] || [ "$final" = interrupted ]; then
-        _CC_WAIT_LINE=$_CC_WAIT_INTERRUPTED_LINE
+      note=$(_cc_wait_edit_note "$id" "$final")
+      # 이 중단 처리 때문에 감독 프로세스가 수정 감시 결과(codex_modified, 확인 실패 error)를 기록하고 끝난 경우도 "멈춤" 이다
+      if [ -z "$final" ] || [ "$final" = interrupted ] || [ "$final" = codex_modified ] \
+         || { [ "$final" = error ] && [ -n "$note" ]; }; then
+        _CC_WAIT_LINE="$_CC_WAIT_INTERRUPTED_LINE${note:+ · $note}"
       else
-        _CC_WAIT_LINE="[cc] 중단됨: Codex 호출 $id 은(는) 중단 전에 이미 끝나 있었습니다 ($final)"
+        _CC_WAIT_LINE="[cc] 중단됨: Codex 호출 $id 은(는) 중단 전에 이미 끝나 있었습니다 ($final)${note:+ · $note}"
       fi ;;
     3)
       # 종료를 확인하지 못했다: 끝 상태는 기록하되 프로세스 기록(running)은 남긴다 (R30)

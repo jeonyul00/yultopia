@@ -1,7 +1,7 @@
 {
   "name": "yultopia",
   "description": "율토피아 작업 규칙 묶음 — 코드리뷰/인수인계/문서 정리 스킬과 Codex 수동 협업, Codex PM 자동 협업",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": {
     "name": "jeonyul00",
     "url": "https://github.com/jeonyul00"

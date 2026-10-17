@@ -9,12 +9,13 @@
 # - Codex 실행은 최대 3회: CC_MAX_CALLS=3 으로 돌려 재시도·형식 재요청까지 합쳐도 3회를 넘지 않는다.
 #   단계마다 호출 수가 단계 번호와 같아야 하고(재시도가 끼면 FAIL), 첫 FAIL 이 나온 단계에서 멈춘다.
 # - 새로 만든 임시 저장소에서만 실행하고 끝나면 지운다. Codex 자체 기록(~/.codex)은 지우지 않는다
-#   (이 smoke 세션의 rollout 파일에서 턴별 sandbox 설정, touch 도구 호출의 결과, 파일 크기만 읽는다).
+#   (이 smoke 세션의 rollout 파일에서 턴별 sandbox 설정과 파일 크기만 읽는다).
 #
 # 세 단계 (Codex 실행 한 번씩)
 #   1 세션 시작: init → call plan → wait. 세션 ID, 스키마 키, verdict plan, 토큰, 이벤트 이름·usage 모양, 인자
-#   2 같은 세션 재개 + 읽기 전용: put message → call message → wait. resume 인자·세션 ID, 기억(마일스톤 개수),
-#     저장소에 cc-smoke-write-test 가 생기지 않음, touch 시도 결과, rollout 의 턴별 sandbox
+#   2 같은 세션 재개 + 프로젝트 파일 수정 없음 (R31/R32: Codex 는 workspace-write 로 명령을 직접 실행한다):
+#     put message → call message → wait. resume 인자(workspace-write)·세션 ID, 기억(마일스톤 개수),
+#     프로젝트 파일이 바뀌지 않음(codex_modified 아님, git status 깨끗함), rollout 의 턴별 sandbox(workspace-write)
 #   3 중단: put message(오래 걸릴 요청) → call message → wait 를 백그라운드로 → 20초 뒤 SIGINT →
 #     wait 130, 감독 프로세스·codex·그룹·자손 없음, last_call.status=interrupted, running=null, status 파일 == state
 #
@@ -39,7 +40,7 @@ export CC_CODEX_BIN="${CC_SMOKE_CODEX_BIN:-codex}"
 . "$ROOT/plugins/yultopia/lib/cc/proc.sh"
 
 BRIEF='README.md 에 한 줄 추가하는 작업. 마일스톤 1개.'
-MSG2='직전 계획의 마일스톤 개수를 summary 에 숫자로 적어라. 그리고 셸에서 `touch cc-smoke-write-test` 를 실행해 보고 결과를 summary 에 적어라. verdict 는 approve, milestone 은 현재 번호.'
+MSG2='직전 계획의 마일스톤 개수를 summary 에 숫자로 적어라. 그리고 셸에서 `git status --short` 를 실행해 보고 결과를 summary 에 적어라. 프로젝트 파일은 만들거나 고치지 마라. verdict 는 approve, milestone 은 현재 번호.'
 MSG3='저장소의 모든 파일을 한 줄씩 아주 자세히 설명하고 개선점을 최대한 많이 적어라'
 TAB=$(printf '\t')
 
@@ -107,12 +108,11 @@ ev_shape_ok() {
                     and (.usage.input_tokens | type) == "number" and (.usage.cached_input_tokens | type) == "number"
                     and (.usage.output_tokens | type) == "number"))' "$1" >/dev/null 2>&1
 }
-# touch cc-smoke-write-test 를 실행한 command_execution 항목
-ev_touch() {
+# Codex 가 실행한 명령(command_execution 항목) 목록. 참고 정보로만 보여준다 (code mode 로 실행한 명령은 여기 나오지 않는다)
+ev_commands() {
   jq -R -r 'fromjson? | select(type == "object" and .type == "item.completed" and ((.item.type // "") == "command_execution"))
-    | .item | select((.command | tostring) | test("cc-smoke-write-test"))
-    | "command=\(.command | tostring) · exit_code=\(.exit_code // "null") · status=\(.status // "?") · output=\((.aggregated_output // "") | tostring | gsub("[\\r\\n\\t]+"; " ") | .[0:200])"' \
-    "$1" 2>/dev/null
+    | .item | "\(.command | tostring | gsub("[\\r\\n\\t]+"; " ") | .[0:120]) → exit_code=\(.exit_code // "null")"' \
+    "$1" 2>/dev/null | tr '\n' ';'
 }
 stderr_tail() {   # <호출 번호>
   local f="$ACTIVE/calls/$1/stderr.log" n
@@ -138,21 +138,6 @@ rollout_policies() {   # 턴마다 "sandbox/approval"
            | "\(.sandbox_policy | if type == "object" then (.type // tostring) else tostring end)/\(.approval_policy // "?" | tostring)"' \
       "$f" 2>/dev/null
   done | tr '\n' ' '
-}
-# touch cc-smoke-write-test 를 실행한 도구 호출의 결과. codex 의 code mode(exec 도구 → tools.exec_command) 로 실행한
-# 명령은 --json 이벤트에 command_execution 으로 나오지 않으므로 rollout 의 도구 호출·결과 쌍(call_id)에서 찾는다.
-rollout_touch() {
-  local f
-  rollout_files "$1" | while IFS= read -r f; do
-    jq -s -r '
-      [.[] | select(.type == "response_item"
-                    and ((.payload.type // "") | test("^(custom_tool_call|function_call|local_shell_call)$"))
-                    and ((.payload.input // .payload.arguments // .payload.action // "") | tostring | test("cc-smoke-write-test")))
-       | .payload.call_id] as $ids
-      | .[] | select(.type == "response_item" and ((.payload.type // "") | test("_output$"))
-                     and (.payload.call_id as $c | any($ids[]; . == $c)))
-      | "\(.payload.type): \(.payload.output | tostring | gsub("[\\r\\n\\t]+"; " ") | .[0:240])"' "$f" 2>/dev/null
-  done
 }
 rollout_bytes() {
   local f s t=0
@@ -391,9 +376,9 @@ EOF
 
   if [ -z "$R_ARGV" ]; then
     report INCONCLUSIVE step1.argv "실행 중 codex 인자를 잡지 못함"
-  elif case "$R_ARGV" in *"exec --json -s read-only --output-schema "*" -o "*" -") true ;; *) false ;; esac \
+  elif case "$R_ARGV" in *"exec --json -s workspace-write --output-schema "*" -o "*" -") true ;; *) false ;; esac \
        && ! case " $R_ARGV " in *" -m "*|*" --model"*|*model_reasoning_effort*|*"model="*) true ;; *) false ;; esac; then
-    report PASS step1.argv "exec --json -s read-only --output-schema … -o … - (모델·추론 강도 인자 없음)"
+    report PASS step1.argv "exec --json -s workspace-write --output-schema … -o … - (모델·추론 강도 인자 없음)"
   else
     report FAIL step1.argv "기대와 다른 인자: $R_ARGV"
   fi
@@ -402,18 +387,18 @@ EOF
   [ "$N_FAIL" -eq "$f0" ]
 }
 
-# ---- 단계 2: 같은 세션 재개 + 읽기 전용 ----
+# ---- 단계 2: 같은 세션 재개 + 프로젝트 파일 수정 없음 ----
 step2() {
-  local out rc f0 ev summary verdict touch pol last_pol porcelain sid_now
+  local out rc f0 ev summary verdict pol last_pol porcelain sid_now lc_status
   f0=$N_FAIL
   out=$(printf '%s\n' "$MSG2" | bash "$CC" put message 2>&1); rc=$?
   if [ "$rc" -ne 0 ]; then report FAIL step2.put "put message 코드 $rc: $out"; return 1; fi
   start_call message 2 || return 1
   if [ -z "$R_ARGV" ]; then
     report INCONCLUSIVE step2.argv "실행 중 codex 인자를 잡지 못함"
-  elif case "$R_ARGV" in *"exec resume --json -c sandbox_mode=\"read-only\" --output-schema "*" -o "*" $SID -") true ;; *) false ;; esac \
+  elif case "$R_ARGV" in *"exec resume --json -c sandbox_mode=\"workspace-write\" --output-schema "*" -o "*" $SID -") true ;; *) false ;; esac \
        && ! case " $R_ARGV " in *" -m "*|*" --model"*|*model_reasoning_effort*|*"model="*) true ;; *) false ;; esac; then
-    report PASS step2.argv "exec resume --json -c sandbox_mode=\"read-only\" --output-schema … -o … $SID - (같은 세션 ID, 모델 인자 없음)"
+    report PASS step2.argv "exec resume --json -c sandbox_mode=\"workspace-write\" --output-schema … -o … $SID - (같은 세션 ID, 모델 인자 없음)"
   else
     report FAIL step2.argv "기대와 다른 인자 (세션 $SID): $R_ARGV"
   fi
@@ -451,34 +436,25 @@ step2() {
     report INCONCLUSIVE step2.memory "summary 에서 '${MS_COUNT}개' 형태를 찾지 못함 — 위 summary 를 사람이 판단"
   fi
 
+  # R32: Codex 는 workspace-write 로 명령을 직접 실행하지만 프로젝트 파일은 바꾸지 않아야 한다
+  #   (바꿨으면 감독 프로세스가 호출을 codex_modified 로 끝낸다. git status 로도 직접 확인한다)
+  lc_status=$(st '.last_call.status // empty')
   porcelain=$(git -C "$REPO" status --porcelain 2>&1)
-  if [ ! -e "$REPO/cc-smoke-write-test" ] && [ ! -L "$REPO/cc-smoke-write-test" ] && [ -z "$porcelain" ]; then
-    report PASS step2.readonly-file "저장소에 cc-smoke-write-test 없음, git status 깨끗함"
+  if [ "$lc_status" != codex_modified ] && [ -z "$porcelain" ]; then
+    report PASS step2.no-project-change "프로젝트 파일이 바뀌지 않음 (last_call.status=$lc_status, codex_modified 아님, git status 깨끗함)"
   else
-    report FAIL step2.readonly-file "Codex 가 저장소에 썼음: $(ls -la "$REPO/cc-smoke-write-test" 2>&1) · git status: $porcelain"
+    report FAIL step2.no-project-change "Codex 실행 중에 프로젝트 파일이 바뀜: last_call.status=$lc_status · message=$(st '.last_call.message // ""') · git status: $porcelain"
   fi
-
-  touch=$(ev_touch "$ev")
-  [ -n "$touch" ] || touch=$(rollout_touch "$SID")
-  if [ -z "$touch" ]; then
-    report INCONCLUSIVE step2.readonly-attempt "Codex 가 touch 를 실행한 기록이 없음 (이벤트·rollout 모두. 프롬프트의 읽기 전용 지시로 스스로 거절했을 수 있음) — sandbox 차단은 아래 rollout 근거로 판단"
-  else
-    # exit_code=0 · "exit_code":0 · \"exit_code\":0 (도구 결과 안에 JSON 이 문자열로 들어 있는 경우) 를 모두 성공으로 본다
-    if printf '%s' "$touch" | grep -Eq 'exit_code[^0-9a-z]{0,8}0([^0-9]|$)'; then
-      report INCONCLUSIVE step2.readonly-attempt "touch 가 성공으로 기록됐는데 파일은 저장소에 없음: $touch"
-    else
-      report PASS step2.readonly-attempt "touch 시도가 막힘: $touch"
-    fi
-  fi
+  info "Codex 가 실행한 명령(이벤트): $(ev_commands "$ev")"
 
   pol=$(rollout_policies "$SID")
   last_pol=$(printf '%s' "$pol" | awk '{ print $NF }')
   if [ -z "$pol" ]; then
-    report INCONCLUSIVE step2.readonly-config "이 세션의 rollout 파일(${CODEX_HOME:-$HOME/.codex}/sessions/…${SID}….jsonl)을 찾지 못함"
+    report INCONCLUSIVE step2.sandbox-config "이 세션의 rollout 파일(${CODEX_HOME:-$HOME/.codex}/sessions/…${SID}….jsonl)을 찾지 못함"
   else
     case "$last_pol" in
-      read-only/*) report PASS step2.readonly-config "rollout 의 턴별 sandbox/approval: $pol(재개한 마지막 턴도 read-only)" ;;
-      *) report FAIL step2.readonly-config "재개한 턴의 sandbox 가 read-only 가 아님. 턴별 sandbox/approval: $pol" ;;
+      workspace-write/*) report PASS step2.sandbox-config "rollout 의 턴별 sandbox/approval: $pol(재개한 마지막 턴도 workspace-write)" ;;
+      *) report FAIL step2.sandbox-config "재개한 턴의 sandbox 가 workspace-write 가 아님. 턴별 sandbox/approval: $pol" ;;
     esac
   fi
 

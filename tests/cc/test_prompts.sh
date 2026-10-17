@@ -51,8 +51,6 @@ test_prompts_state_pm_rules() {
   assert_contains "$p" "한국어"
   assert_contains "$p" "JSON"
   r=$(cat "$TPL_DIR/pm-review.md")
-  assert_contains "$r" "테스트를 다시 돌리지"
-  assert_contains "$r" "권한 오류"
   assert_contains "$r" "파일을 만들거나 고치지"
   for v in approve reject done ask_user; do assert_contains "$r" "$v"; done
   assert_contains "$(cat "$TPL_DIR/pm-message.md")" "최우선"
@@ -72,4 +70,35 @@ test_prompts_state_pm_rules() {
   fr=$(cat "$TPL_DIR/pm-format-retry.md")
   assert_contains "$fr" "{{REASON}}"
   assert_contains "$fr" "채우거나 고쳐서"
+}
+# ---- R31/R32: Codex 는 테스트·빌드·린트를 직접 돌려 확인하되, 프로젝트 파일은 바꾸지 않는다 (바뀌면 작업이 멈춤) ----
+test_prompts_let_codex_run_tests_but_not_edit_files() {
+  for t in pm-plan pm-review pm-message pm-format-retry; do
+    p=$(cat "$TPL_DIR/$t.md")
+    assert_contains "$p" "프로젝트 파일" "$t"
+    assert_contains "$p" "멈춥니다" "$t"
+    assert_not_contains "$p" "읽기만 합니다" "$t"
+    assert_not_contains "$p" "다시 돌리지" "$t"
+    assert_not_contains "$p" "권한 오류" "$t"
+  done
+  for t in pm-plan pm-review pm-message; do
+    p=$(cat "$TPL_DIR/$t.md")
+    assert_contains "$p" "직접 실행" "$t"
+    assert_contains "$p" "git 이 무시하는 파일" "$t"
+    assert_contains "$p" "네트워크는 막혀 있습니다" "$t"
+    assert_contains "$p" "반려 근거가 아닙니다" "$t"
+    assert_contains "$p" "findings" "$t"
+    assert_contains "$p" "Claude 만 고칩니다" "$t"
+  done
+  r=$(cat "$TPL_DIR/pm-review.md")
+  # 검수 때는 테스트·빌드·린트를 반드시 직접 돌리고, Claude 가 저장한 검증 출력과 비교한다
+  assert_contains "$r" "반드시 직접 실행"
+  assert_contains "$r" "{{VERIFY_DIR}}"
+  assert_contains "$r" "비교"
+  # 승인 책임: 완료 기준을 직접 확인했을 때만 approve·done, 반려에는 구체적인 보완 지시
+  assert_contains "$r" "책임"
+  assert_contains "$r" "완료 기준"
+  assert_contains "$r" "보완할 내용"
+  assert_contains "$(cat "$TPL_DIR/pm-plan.md")" "최우선"
+  assert_contains "$(cat "$TPL_DIR/pm-review.md")" "최우선"
 }

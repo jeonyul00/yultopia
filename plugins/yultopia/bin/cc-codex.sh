@@ -9,6 +9,9 @@ CC_SELF_ABS="$SELF_DIR/$(basename "$SELF")"
 for _cc_lib in common state snapshot proc render call wait housekeeping put; do
   . "$LIB_DIR/$_cc_lib.sh" || { echo "[cc] 내부 오류: $LIB_DIR/$_cc_lib.sh 를 불러오지 못했습니다"; exit 1; }
 done
+# 끝 상태 없이 끝난 호출을 정리할 때 작업 트리를 다시 떠서 Codex 의 파일 수정을 비교해도 되는 실행이다 (wait.sh
+#   _cc_edit_recheck_prepare. Codex 리뷰 1차 2·3). 훅(cc-hook.sh)은 빨라야 하므로 이 값을 두지 않는다
+_CC_EDIT_SETTLE_OK=1
 
 cc_init_fail() {
   # 이 실행이 만든 active 를 치우고 한 줄 오류 출력, 종료 코드 1
