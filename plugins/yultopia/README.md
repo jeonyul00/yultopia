@@ -1,14 +1,14 @@
 # yultopia 플러그인
 
-한국어 코드리뷰·버그조사·인수인계·문서동기화 스킬 묶음. Codex 자동 검수 연동(선택).
+한국어 코드리뷰·인수인계·문서 정리 스킬 묶음. Codex 수동 협업 포함.
 
 설치 방법과 스킬 설명은 저장소 루트의 [README](../../README.md)를 본다.
 
 ## 구성
 
-- `skills/` — init, code-review, find-bug, update-docs, handoff, collab, collab-on, collab-off, collab-status
-- `hooks/hooks.json` — SessionStart(인수인계 주입), UserPromptSubmit/Stop(Codex 자동 검수)
-- `bin/` — codex-review.sh, inject-handoff.sh, codex-review.schema.json
+- `skills/` — init, code-review, update-docs, handoff, collab
+- `hooks/hooks.json` — SessionStart(인수인계 주입)
+- `bin/` — inject-handoff.sh
 
 ## 프로젝트 고유 규칙
 

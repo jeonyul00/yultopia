@@ -26,7 +26,7 @@ git rev-parse --show-toplevel 2>/dev/null || echo "NOT_A_GIT_REPO"
 ```
 
 - 단일 git 저장소인지, 하위에 여러 저장소를 가진 워크스페이스인지 판별한다.
-- 워크스페이스면 하위 저장소 목록을 찾고, **자동 검수는 하위 저장소 안에서만 켤 수 있다**는 사실을 절에 적는다.
+- 워크스페이스면 하위 저장소 목록을 찾아 절에 적는다.
 
 ### 2. 스택과 실행 명령 (실제 파일에서만)
 
@@ -72,7 +72,7 @@ echo "${CLAUDE_PROJECT_DIR:-$PWD}/AGENTS.md"
 <!-- BEGIN yultopia -->
 ## Yultopia 중점 점검 항목
 
-Yultopia 스킬과 Codex 자동 검수가 이 절을 읽고 이 프로젝트의 우선 위험으로 삼는다.
+Yultopia 스킬이 이 절을 읽고 이 프로젝트의 우선 위험으로 삼는다.
 `/yultopia:init` 로 생성. 실제와 달라지면 다시 실행하거나 직접 고친다.
 
 ### 저장소 구조
