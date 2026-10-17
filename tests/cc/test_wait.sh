@@ -564,3 +564,87 @@ test_waiter_killed_during_interrupt_still_leaves_consistent_state() {
   w=$(state '.waiter.pid // empty')
   [ -z "$w" ] || ! kill -0 "$w" 2>/dev/null || _fail "살아 있는 대기자 기록이 남음 ($w)"
 }
+
+# ---- 최종 리뷰 Important 1: 중단 신호 → 그룹 TERM 사이에 state 를 다시 읽지 않는다 (지연 줄이기) ----
+# TERM 을 받은 시각을 기록하는 codex 대역 (thread.started 한 줄을 쓰고 계속 기다린다)
+wt_term_stamp_codex() {
+  cat > "$TMP/stamp-codex" <<'PL'
+#!/usr/bin/perl
+use Time::HiRes qw(time sleep);
+$SIG{TERM} = sub { open my $h, ">", "$ENV{WT_STAMP_DIR}/term-at"; printf $h "%.6f\n", time; close $h; exit 0 };
+$| = 1;
+print "{\"type\":\"thread.started\",\"thread_id\":\"stamp-thread\"}\n";
+sleep 0.1 while 1;
+PL
+  chmod +x "$TMP/stamp-codex"
+}
+# jq·git 을 부를 때마다 시각을 남기는 대역 (그 뒤 진짜 명령을 실행)
+wt_stamp_shims() {
+  local real
+  mkdir -p "$TMP/shim"
+  for c in jq git; do
+    real=$(command -v "$c")
+    printf '#!/bin/sh\nperl -MTime::HiRes -e '"'"'printf "%%.6f\\n", Time::HiRes::time'"'"' >> "$WT_STAMP_DIR/%s.calls"\nexec "%s" "$@"\n' "$c" "$real" > "$TMP/shim/$c"
+    chmod +x "$TMP/shim/$c"
+  done
+}
+# <파일> <시작> <끝> : 그 사이에 기록된 줄 수
+wt_stamps_between() {
+  [ -f "$1" ] || { echo 0; return; }
+  perl -ne 'BEGIN { ($a, $b) = splice @ARGV, 1 } $n++ if $_ > $a && $_ < $b; END { print $n + 0, "\n" }' "$1" "$2" "$3"
+}
+test_interrupt_sends_term_before_rereading_state() {
+  export WT_STAMP_DIR="$TMP"
+  wt_term_stamp_codex; wt_stamp_shims
+  CC_CODEX_BIN="$TMP/stamp-codex"; export CC_CODEX_BIN
+  start_task; run_cc call plan; assert_code 0
+  wt_until 5 wt_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid)
+  # 대기자는 첫 확인만 하고 30초 잔다: 신호는 확실히 잠자는 동안 도착한다
+  CC_POLL_SECS=30 WT_WAITER_PATH="$TMP/shim:$PATH" wt_start_waiter --max 60
+  wt_until 5 wt_waiter_registered || _fail "waiter 가 등록되지 않음"
+  wt_until 5 eval '[ "$(state ".waiter_last_seen_at // empty")" != "" ]' || _fail "첫 확인이 끝나지 않음"
+  sleep 0.5
+  t0=$(perl -MTime::HiRes -e 'printf "%.6f\n", Time::HiRes::time')
+  kill -INT "$WP"; wait "$WP"; rc=$?
+  assert_eq "$rc" "130"
+  assert_eq "$(cat "$TMP/w.out")" "[cc] 중단됨: Codex 종료"
+  t1=$(cat "$TMP/term-at" 2>/dev/null)
+  [ -n "$t1" ] || _fail "codex 가 TERM 을 받지 않음"
+  # 첫 TERM 전에는 state 를 다시 읽지 않고(jq 없음) 잠금을 쥐지 않았으면 풀지도 않는다(git 없음)
+  assert_eq "$(wt_stamps_between "$TMP/jq.calls" "$t0" "$t1")" "0" "TERM 전 jq 호출 수"
+  assert_eq "$(wt_stamps_between "$TMP/git.calls" "$t0" "$t1")" "0" "TERM 전 git 호출 수"
+  ms=$(perl -e 'printf "%d", ($ARGV[1] - $ARGV[0]) * 1000' "$t0" "$t1")
+  [ "$ms" -lt 500 ] || _fail "중단 신호 뒤 TERM 까지 ${ms}ms"
+  wt_group_alive "$pg" && _fail "감독 프로세스 그룹이 남아 있음"
+  wt_assert_terminal 1 interrupted interrupted
+}
+
+# ---- 최종 리뷰 minor f: 중단 경로에서도 codex 에 TERM 뒤 3초를 준다 (스스로 MCP 도우미를 정리하도록) ----
+test_interrupt_gives_codex_three_seconds_to_shut_down() {
+  # TERM 을 받으면 2초 걸려 정리하고 끝나는 codex 대역 (1초 만에 KILL 하면 정리 표시가 남지 않는다)
+  cat > "$TMP/slow-exit-codex" <<'PL'
+#!/usr/bin/perl
+use Time::HiRes qw(sleep);
+$SIG{TERM} = sub { $SIG{TERM} = "IGNORE"; sleep 2; open my $h, ">", "$ENV{WT_STAMP_DIR}/shutdown-done"; close $h; exit 0 };
+$| = 1;
+print "{\"type\":\"thread.started\",\"thread_id\":\"slow-exit-thread\"}\n";
+sleep 0.1 while 1;
+PL
+  chmod +x "$TMP/slow-exit-codex"
+  export WT_STAMP_DIR="$TMP"
+  CC_CODEX_BIN="$TMP/slow-exit-codex"; export CC_CODEX_BIN
+  start_task; run_cc call plan; assert_code 0
+  wt_until 5 wt_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid)
+  wt_start_waiter --max 60
+  wt_until 5 wt_waiter_registered || _fail "waiter 가 등록되지 않음"
+  t0=$SECONDS
+  kill -INT "$WP"; wait "$WP"; rc=$?
+  assert_eq "$rc" "130"
+  [ $((SECONDS - t0)) -le 12 ] || _fail "중단 처리가 너무 오래 걸림 ($((SECONDS - t0))초)"
+  assert_file_exists "$TMP/shutdown-done"
+  assert_eq "$(cat "$TMP/w.out")" "[cc] 중단됨: Codex 종료"
+  wt_group_alive "$pg" && _fail "감독 프로세스 그룹이 남아 있음"
+  wt_assert_terminal 1 interrupted interrupted
+}

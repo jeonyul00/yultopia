@@ -105,3 +105,44 @@ test_skill_reads_verify_log_when_exit_unknown() {
   assert_contains "$s" "\`(exit=…)\` 가 없거나"
   assert_contains "$s" "실패한 검증 출력 원문"
 }
+# ---- 최종 리뷰 Important 1: 사용자가 멈추라고 하면 check-orphan --kill 을 먼저 (실행 중 거부·Esc 뒤·버리기/마무리 거부) ----
+skill_section() {   # <장 번호> : "## N." 부터 다음 "## " 앞까지
+  awk -v n="## $1." 'index($0, n) == 1 { on = 1; print; next } on && /^## / { exit } on { print }' "$SKILL_FILE"
+}
+test_skill_stop_request_kills_before_relaying() {
+  s=$(cat "$SKILL_FILE")
+  assert_contains "$s" "**Codex 멈추기**"
+  # 멈추기 결과 해석: 끝냈으면 원래 명령을 한 번 다시, 확인 못 함·남음이면 알리고 멈춤
+  stop=$(awk '/^\*\*Codex 멈추기\*\*/ { on = 1 } on && /^## / { exit } on { print }' "$SKILL_FILE")
+  assert_contains "$stop" "cc-codex.sh check-orphan --kill"
+  assert_contains "$stop" "사용자 말을 Codex에 전하기 전에"
+  assert_contains "$stop" "종료했습니다"
+  assert_contains "$stop" "확인하지 못해"
+  assert_contains "$stop" "KILL 뒤에도"
+  assert_contains "$stop" "ps -o pid,command -g"
+  assert_contains "$stop" "한 번만 다시"
+  # 세 곳에서 이 절차를 쓴다
+  s7=$(skill_section 7); assert_contains "$s7" "\"이미 실행 중\""; assert_contains "$s7" "Codex 멈추기"
+  s9=$(skill_section 9); assert_contains "$s9" "Esc"; assert_contains "$s9" "Codex 멈추기"
+  s2=$(skill_section 2); assert_contains "$s2" "Codex가 실행 중입니다"; assert_contains "$s2" "Codex 멈추기"
+  s11=$(skill_section 11); assert_contains "$s11" "Codex가 실행 중입니다"; assert_contains "$s11" "Codex 멈추기"
+}
+# ---- 최종 리뷰 Important 2: init 8 (작업 트리가 깨끗하지 않음) ----
+test_skill_handles_init_dirty_exit_8() {
+  s3=$(skill_section 3)
+  assert_contains "$s3" "8(커밋되지 않은 변경"
+  assert_contains "$s3" "구분할 수 없어"
+  assert_contains "$s3" "정리본 전문"
+  assert_contains "$s3" "묻지 않고"
+}
+# ---- 최종 리뷰 minor h: put 도 작업이 없으면 5 ----
+test_skill_put_mentions_exit_5() {
+  s1=$(skill_section 1)
+  assert_contains "$s1" "진행 중인 작업이 없으면 5"
+}
+# ---- 최종 리뷰 minor c: done 뒤 추가 수정은 새 마일스톤 ----
+test_skill_extra_work_after_done_is_new_milestone() {
+  s11=$(skill_section 11)
+  assert_contains "$s11" "새 마일스톤"
+  assert_contains "$s11" "지금 번호 + 1"
+}

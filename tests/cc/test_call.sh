@@ -152,7 +152,8 @@ test_verdicts_update_phase_and_rejects() {
   FAKE_CODEX_RESULT=$(call_result ask_user null); run_cc call message; assert_code 0; wait_until_status_file 3
   assert_eq "$(state .phase)" "asking"; assert_eq "$(state .rejects_in_row)" "0"
   FAKE_CODEX_RESULT=$(call_result done null); run_cc call message; assert_code 0; wait_until_status_file 4
-  assert_eq "$(state .phase)" "done"
+  # 최종 리뷰 minor b: 메시지 호출의 done 은 검수가 아니므로 작업 완료가 아니다 → 이어가기(working)
+  assert_eq "$(state .phase)" "working"
   assert_eq "$(state .last_call.status)" "ok"; assert_eq "$(state .last_call.verdict)" "done"
   assert_eq "$(state .calls_total)" "4"
   assert_eq "$(state .tokens.output)" "40"
@@ -211,6 +212,67 @@ test_message_approve_without_milestone_adopts_codex_milestone() {
   assert_eq "$(state .milestone)" "1"
   assert_eq "$(state .rejects_in_row)" "0"
   assert_eq "$(state .milestone_base_tree)" "null"
+}
+# ---- 최종 리뷰 minor c: done 뒤 추가 수정 요구(call message)는 새 마일스톤. 기준은 메시지 호출 때의 작업 트리 ----
+call_tree_now() { GIT_INDEX_FILE="$TMP/expect.index" sh -c 'git read-tree HEAD && git add -A && git write-tree'; }
+call_to_done() {   # 계획 → 작업 → 검수 done 까지 (마일스톤 1)
+  run_cc call plan; wait_until_status_file 1 || _fail "calls/1/status 가 생기지 않음"
+  mkdir -p src; echo a > src/a.txt
+  printf '%s' "$REVIEW_REPORT" > "$(cc_path report)"
+  FAKE_CODEX_RESULT=$(call_result done null); run_cc call review; assert_code 0
+  wait_until_status_file 2 || _fail "calls/2/status 가 생기지 않음"
+  assert_eq "$(state .phase)" "done"
+}
+test_message_after_done_starts_new_milestone_from_fresh_base() {
+  start_task; call_to_done
+  set_state '.rejects_in_row = 2'
+  want=$(call_tree_now)
+  [ "$want" != "$(state .milestone_base_tree)" ] || _fail "테스트 전제 깨짐: 기준 트리가 같음"
+  printf '사용자 지시: b 도 추가해 줘\n' > "$(cc_path message)"
+  FAKE_CODEX_RESULT=$(call_result approve 2); run_cc call message; assert_code 0
+  wait_until_status_file 3 || _fail "calls/3/status 가 생기지 않음"
+  assert_eq "$(cat "$ACTIVE/calls/3/status")" "ok"
+  assert_eq "$(state .milestone)" "2"
+  assert_eq "$(state .milestone_base_tree)" "$want"
+  assert_eq "$(state .rejects_in_row)" "0"
+  assert_eq "$(state .phase)" "working"
+  assert_eq "$(state .milestones_total)" "2"
+  assert_eq "$(state .running)" "null"
+  # Codex 에는 완료 뒤의 추가 수정 요구라는 것이 전해진다
+  assert_contains "$(cat "$FAKE_CODEX_LOG/3.stdin")" "지금 단계: done"
+  # 다음 검수는 새 작업만 본다: 마일스톤 2, 기준 = 메시지 호출 때의 트리
+  echo b > src/b.txt
+  FAKE_CODEX_RESULT=$(call_result approve 3); run_cc call review; assert_code 0
+  wait_until_status_file 4 || _fail "calls/4/status 가 생기지 않음"
+  p4=$(cat "$FAKE_CODEX_LOG/4.stdin")
+  assert_contains "$p4" "마일스톤 2 을 검수"
+  assert_contains "$p4" "git diff $want "
+}
+test_message_after_done_advances_even_if_codex_keeps_number() {
+  start_task; call_to_done
+  want=$(call_tree_now)
+  printf '사용자 지시: 조금 더\n' > "$(cc_path message)"
+  # Codex 가 지금 번호(1)를 그대로 주어도 새 마일스톤(2)으로 센다. 전체 수보다 커지면 전체 수도 늘린다
+  set_state '.milestones_total = 1'
+  FAKE_CODEX_RESULT=$(call_result approve 1); run_cc call message; assert_code 0
+  wait_until_status_file 3 || _fail "calls/3/status 가 생기지 않음"
+  assert_eq "$(state .milestone)" "2"; assert_eq "$(state .milestones_total)" "2"
+  assert_eq "$(state .milestone_base_tree)" "$want"; assert_eq "$(state .phase)" "working"
+  # 이어지는 메시지(이제 done 아님)는 평소처럼 지금 마일스톤·기준을 유지한다
+  FAKE_CODEX_RESULT=$(call_result approve 2); run_cc call message; assert_code 0
+  wait_until_status_file 4 || _fail "calls/4/status 가 생기지 않음"
+  assert_eq "$(state .milestone)" "2"; assert_eq "$(state .milestone_base_tree)" "$want"
+  assert_contains "$(cat "$FAKE_CODEX_LOG/4.stdin")" "지금 단계: working"
+}
+test_message_after_done_question_still_opens_new_milestone() {
+  # Codex 가 먼저 물어도(ask_user) 새 마일스톤의 기준은 사용자가 추가 수정을 요구한 그때의 트리다
+  start_task; call_to_done
+  want=$(call_tree_now)
+  printf '사용자 지시: 추가 기능\n' > "$(cc_path message)"
+  FAKE_CODEX_RESULT=$(call_result ask_user null); run_cc call message; assert_code 0
+  wait_until_status_file 3 || _fail "calls/3/status 가 생기지 않음"
+  assert_eq "$(state .phase)" "asking"
+  assert_eq "$(state .milestone)" "2"; assert_eq "$(state .milestone_base_tree)" "$want"
 }
 test_message_prompt_names_current_milestone() {
   start_task; run_cc call plan; wait_until_status_file 1

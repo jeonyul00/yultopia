@@ -12,6 +12,7 @@
 # 종료 코드 계약 (Ruling R8)
 #   cc_proc_identity        0 출력함 / 1 그런 프로세스 없음 / 2 알 수 없음
 #   cc_proc_alive_verified  0 살아 있고 신원 일치 / 1 확실히 없음 또는 PID 재사용 / 2 불확실
+#   cc_proc_alive_detail    위와 같되 1 을 나눈다: 1 PID 없음(또는 시작 시각만 다름) / 4 명령줄부터 다른 프로세스(재사용)
 #   cc_kill_group_verified, cc_kill_group_via_member
 #     0 = 신호를 보냈고 그룹이 사라짐
 #     1 = 우리 것이 아님이 확인됨 / 없음 → 아무 신호도 보내지 않음
@@ -133,12 +134,33 @@ cc_proc_identity() {
 #   1 = 확실히 없음, 또는 신원 불일치(다른 프로세스가 PID 를 재사용)
 #   2 = 불확실(ps 실패, 인자 형식 오류)
 cc_proc_alive_verified() {
+  cc_proc_alive_detail "$1" "$2"
+  case $? in
+    0) return 0 ;;
+    1|4) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# cc_proc_alive_detail <pid> <identity> : cc_proc_alive_verified 와 같지만 1 을 둘로 나눈다 (최종 리뷰 minor e)
+#   0 = 살아 있고 신원 일치
+#   1 = 그런 PID 가 없음, 또는 명령줄은 같은데 시작 시각만 다름
+#   4 = 그 PID 를 명령줄부터 다른 프로세스가 씀 (재사용이 분명함)
+#   2 = 불확실
+#   그룹 리더에 쓰면: PID 는 같은 번호의 프로세스 그룹이 있는 동안 재사용되지 않으므로 4 는 "그 그룹은 이미 없음" 이다.
+#   시작 시각만 다르면 4 로 보지 않는다: lstart 는 지역 시각이라 기록한 쪽과 확인하는 쪽의 시간대(TZ)가 다르면 같은
+#   프로세스도 그렇게 보인다. 그때는 예전처럼 1 로 두어 호출한 쪽이 그룹을 직접 확인하게 한다 (살아 있는 우리 그룹을
+#   "이미 없음" 으로 잘못 보지 않도록).
+cc_proc_alive_detail() {
   local pid="$1" want="$2" cur rc
   _cc_proc_is_pid "$pid" || return 2
   case "$want" in ?*'|'*) ;; *) return 2 ;; esac
   cur=$(cc_proc_identity "$pid"); rc=$?
   case "$rc" in
-    0) [ "$cur" = "$want" ] && return 0; return 1 ;;
+    0)
+      [ "$cur" = "$want" ] && return 0
+      [ "${cur#*|}" = "${want#*|}" ] && return 1
+      return 4 ;;
     1) return 1 ;;
     *) return 2 ;;
   esac
@@ -274,7 +296,7 @@ cc_kill_group_via_member() {
 #   - 그룹 전체 신호(kill -- -PGID)는 리더에게도 가므로 쓰지 않는다. ps 로 멤버를 찾고, 멤버마다 신호 직전에
 #     그 PID 가 아직 이 그룹인지 다시 확인한 뒤 하나씩 보낸다. 좀비는 이미 끝난 것으로 본다.
 #   - TERM → 최대 term_secs 초(기본 3) → 남으면 KILL → 최대 약 2초. 그 사이 새로 생긴 멤버도 처음 보일 때 TERM 을 받는다.
-#     (감독 프로세스가 중단 신호를 받았을 때는 멤버도 이미 같은 TERM 을 받았으므로 짧게 1초를 준다)
+#     (감독 프로세스는 시간 상한·중단 신호 모두 기본 3초를 쓴다: codex 가 MCP 도우미를 스스로 정리할 시간)
 #   0 = 남은 멤버 없음 (신호를 보냈든 처음부터 없었든) / 2 = 거부·판단 불가 (신호 안 보냄) / 3 = KILL 뒤에도 남음
 cc_kill_own_group_members() {
   local leader="$1" term="${2:-3}"

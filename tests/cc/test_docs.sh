@@ -17,3 +17,14 @@ test_plugin_readme_lists_cc_parts() {
   assert_contains "$r" "cc-codex.sh"; assert_contains "$r" "cc-hook.sh"; assert_contains "$r" "lib/cc"
   assert_contains "$r" "UserPromptSubmit"
 }
+test_readme_cc_notes_cover_limits_and_helpers() {
+  # 최종 리뷰 minor i: 호출 상한, 연속 반려 멈춤, 재시도 규칙, 강제 종료 때 남을 수 있는 Codex 도우미
+  notes=$(awk '/^#### `\/yultopia:cc` 알아둘 것/ { on = 1; next } on && /^##/ { exit } on { print }' "$CC_REPO_ROOT/README.md")
+  assert_contains "$notes" "20회"
+  assert_contains "$notes" "연속 3번 반려"
+  assert_contains "$notes" "한 번만 다시 시도"
+  assert_contains "$notes" "시간 초과는 다시 시도하지 않는다"
+  assert_contains "$notes" "MCP"
+  assert_contains "$notes" "codex-code-mode-host"
+  assert_contains "$notes" "pgrep -fl 'mcp|codex-code-mode-host'"
+}

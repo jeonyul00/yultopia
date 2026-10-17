@@ -268,6 +268,65 @@ test_check_orphan_kill_changes_nothing_when_unverifiable() {
   hk_reap
 }
 
+# ==== 최종 리뷰 Important 1: 사용자가 시킨 종료(check-orphan --kill)는 고아 유예를 기다리지 않는다 ====
+test_check_orphan_kill_stops_call_inside_orphan_grace() {
+  FAKE_CODEX_SEQ=hang; CC_ORPHAN_GRACE_SECS=60; start_task; run_cc call plan; assert_code 0
+  hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid)
+  # 알리기만 하는 쪽(평소 check-orphan, 메시지 훅)은 유예를 그대로 지킨다
+  run_cc check-orphan; assert_code 0; assert_eq "$OUT" ""
+  hook_out=$(printf '{"cwd":"%s"}' "$PWD" | bash "$HOOK" prompt-submit 2>/dev/null)
+  assert_eq "$hook_out" ""
+  # Esc 로 대기가 끊긴 직후: 사용자가 멈추라고 하면 유예 안이어도 바로 멈춘다
+  run_cc check-orphan --kill; assert_code 10
+  assert_eq "$OUT" "[cc] 남아 있던 Codex를 종료했습니다"
+  assert_no_process_matching "fake-codex-hang:$FAKE_CODEX_LOG"
+  hk_group_alive "$pg" && _fail "감독 프로세스 그룹이 남아 있음"
+  hk_assert_terminal 1 interrupted interrupted
+  # 이제 사용자 말을 전할 수 있다 (예전에는 "이미 실행 중" 으로 막혔다)
+  printf '사용자 지시: 방향 바꿔\n' | run_cc put message; assert_code 0
+  run_cc call message; assert_code 0
+  wait_until_status_file 2 || _fail "calls/2/status 가 생기지 않음"
+  assert_eq "$(cat "$ACTIVE/calls/2/status")" "ok"
+}
+test_check_orphan_kill_inside_grace_lets_discard_proceed() {
+  FAKE_CODEX_SEQ=hang; CC_ORPHAN_GRACE_SECS=60; start_task; run_cc call plan; assert_code 0
+  hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  run_cc discard; assert_code 6; assert_contains "$OUT" "먼저 종료하세요"
+  run_cc check-orphan --kill; assert_code 10
+  assert_eq "$OUT" "[cc] 남아 있던 Codex를 종료했습니다"
+  run_cc discard; assert_code 0
+  assert_no_path "$ACTIVE"
+  assert_no_process_matching "fake-codex-hang:$FAKE_CODEX_LOG"
+}
+test_check_orphan_kill_never_acts_while_waiter_alive() {
+  # 유예를 건너뛰어도 다른 조건은 그대로: 살아 있는 대기자가 기다리는 호출은 멈추지 않는다
+  FAKE_CODEX_SEQ=hang; CC_ORPHAN_GRACE_SECS=60; start_task; run_cc call plan; assert_code 0
+  hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid); cp=$(state .running.codex_pid)
+  CC_POLL_SECS=30 hk_start_waiter --max 20
+  hk_until 5 hk_waiter_registered || _fail "waiter 가 등록되지 않음"
+  run_cc check-orphan --kill; assert_code 0
+  assert_eq "$OUT" ""
+  kill -0 "$cp" 2>/dev/null || _fail "살아 있는 대기자가 있는데 Codex 를 죽임"
+  hk_group_alive "$pg" || _fail "살아 있는 대기자가 있는데 그룹을 죽임"
+  assert_eq "$(state .running.call_id)" "1"
+  kill -TERM "$WP"; wait "$WP"; rc=$?
+  assert_eq "$rc" "130"
+}
+test_check_orphan_kill_inside_grace_changes_nothing_when_unverifiable() {
+  # R8: 확인할 수 없으면(2) 유예를 건너뛰어도 아무것도 바꾸지 않는다
+  FAKE_CODEX_SEQ=hang; CC_ORPHAN_GRACE_SECS=60; start_task; run_cc call plan; assert_code 0
+  hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid)
+  hk_fake_ps_fail_pgid
+  PATH="$TMP/bin:$PATH" run_cc check-orphan --kill; assert_code 10
+  assert_eq "$(hk_lines "$OUT")" "1"; assert_contains "$OUT" "확인하지 못해"
+  assert_eq "$(state .running.call_id)" "1"; assert_no_path "$CALL1/status"
+  hk_group_alive "$pg" || _fail "확인하지 못한 채 그룹을 죽임"
+  hk_reap
+}
+
 # ==== addendum D: 감독 프로세스·codex 는 없는데 확인할 수 없는 것이 그룹에 남은 경우 (막다른 길 없음) ====
 test_unverifiable_leftover_group_is_reported_not_killed() {
   FAKE_CODEX_SEQ=hang; start_task; run_cc call plan; assert_code 0
@@ -302,6 +361,67 @@ test_unverifiable_leftover_group_is_reported_not_killed() {
   hk_assert_terminal 1 interrupted interrupted
   run_cc discard; assert_code 0
   assert_no_path "$ACTIVE"
+}
+
+# ==== 최종 리뷰 minor e: 그룹 리더 PID 가 "없음" 인지 "다른 프로세스가 씀(재사용)" 인지 나눈다 ====
+#   PID 는 같은 번호의 프로세스 그룹이 있는 동안 재사용되지 않는다. 그래서 리더 PID 를 신원이 다른 프로세스가 쓰고 있으면
+#   우리 그룹은 이미 끝났다 → 그룹 확인 없이 dead. 리더가 없고 그룹이 비어 있지 않을 때만 남은 그룹(leftover)이다.
+test_reused_leader_pid_is_dead_not_leftover() {
+  hk_source_libs
+  start_task
+  # 다른 프로세스가 그 번호로 자기 그룹을 이끌고 있다 (우리 감독 프로세스와 신원이 다름)
+  other=$(cc_spawn_group "$TMP/other.log" perl -e 'sleep 60' "unrelated-leader-$TMP") || _fail "대역 준비 실패"
+  oid=$(cc_proc_identity "$other") || _fail "신원을 얻지 못함"
+  mkdir -p "$ACTIVE/calls/1"
+  set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $other,
+    supervisor_identity: \"Thu Jan  1 00:00:00 2020|bash /x/cc-codex.sh _supervise 1\", codex_pid: null,
+    codex_identity: null, started_at: \"$(hk_iso_ago 600)\", review_tree: null}"
+  _cc_call_liveness "$(cat "$ACTIVE/state.json")"
+  assert_eq "$_CC_LIVENESS" "dead"
+  assert_eq "$_CC_LIVENESS_LEFTOVER" "0"
+  # 중단 처리도 같은 판단: 아무 신호도 보내지 않고 "끝남" (0)
+  _cc_wait_stop_group "$other" "Thu Jan  1 00:00:00 2020|bash /x/cc-codex.sh _supervise 1" "" ""; r=$?
+  assert_eq "$r" "0" "_cc_wait_stop_group"
+  # check-orphan 은 남은 그룹으로 알리지 않고 죽은 기록으로 정리한다. 다른 프로세스는 건드리지 않는다
+  run_cc check-orphan; assert_code 0; assert_eq "$OUT" ""
+  hk_assert_terminal 1 interrupted interrupted
+  run_cc discard; assert_code 0
+  assert_code_of 0 cc_proc_alive_verified "$other" "$oid"
+  kill -KILL -- "-$other" 2>/dev/null
+}
+test_leader_with_same_command_but_other_start_time_is_not_declared_dead() {
+  # 시작 시각만 다르고 명령줄이 같으면(예: 기록한 쪽과 확인하는 쪽의 시간대 차이) 재사용으로 단정하지 않는다:
+  #   그 그룹이 살아 있으면 dead 로 지우지 않는다 (예전처럼 그룹을 직접 확인, 확인할 수 없는 것으로 남김)
+  hk_source_libs
+  start_task
+  other=$(cc_spawn_group "$TMP/other.log" perl -e 'sleep 60' "same-cmd-leader-$TMP") || _fail "대역 준비 실패"
+  oid=$(cc_proc_identity "$other") || _fail "신원을 얻지 못함"
+  mkdir -p "$ACTIVE/calls/1"
+  set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $other,
+    supervisor_identity: \"Thu Jan  1 00:00:00 2020|${oid#*|}\", codex_pid: null,
+    codex_identity: null, started_at: \"$(hk_iso_ago 600)\", review_tree: null}"
+  _cc_call_liveness "$(cat "$ACTIVE/state.json")"
+  [ "$_CC_LIVENESS" != dead ] || _fail "살아 있는 그룹을 dead 로 봄"
+  run_cc discard; assert_code 6
+  assert_file_exists "$ACTIVE/state.json"
+  assert_code_of 0 cc_proc_alive_verified "$other" "$oid"
+  kill -KILL -- "-$other" 2>/dev/null
+}
+test_absent_leader_with_live_group_stays_leftover() {
+  hk_source_libs
+  start_task
+  hk_leftover_group || _fail "남은 그룹 준비 실패"
+  mkdir -p "$ACTIVE/calls/1"
+  set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $LEFT_PG,
+    supervisor_identity: \"Thu Jan  1 00:00:00 2020|bash /x/cc-codex.sh _supervise 1\", codex_pid: null,
+    codex_identity: null, started_at: \"$(hk_iso_ago 600)\", review_tree: null}"
+  _cc_call_liveness "$(cat "$ACTIVE/state.json")"
+  assert_eq "$_CC_LIVENESS" "uncertain"
+  assert_eq "$_CC_LIVENESS_LEFTOVER" "1"
+  _cc_wait_stop_group "$LEFT_PG" "Thu Jan  1 00:00:00 2020|bash /x/cc-codex.sh _supervise 1" "" ""; r=$?
+  assert_eq "$r" "2" "_cc_wait_stop_group"
+  kill -0 "$LEFT_MEMBER" 2>/dev/null || _fail "확인되지 않은 프로세스를 죽임"
+  kill -KILL "$LEFT_MEMBER" 2>/dev/null
 }
 
 # ==== cleanup-stale (14일, last_activity_at 기준) ====

@@ -367,13 +367,20 @@ test_call_refuses_when_dead_supervisor_group_still_has_members() {
 
 # ---- addendum C: exec 확인이 늦어도 codex 신원 기록을 포기하지 않는다 ----
 # (Task 5 의 첫 확인 구간은 ps 호출을 포함해 실제로 7~8초 걸리므로 그보다 늦게 exec 한다)
-cf_slow_exec_codex() { sleep 11; exec perl -e 'sleep 1' "slow-exec-codex:$TMP"; }
+# exec 한 뒤에는 신원이 state 에 기록될 때까지(최대 약 15초) 살아 있는다: 바쁜 기계에서 1초 안에 기록하지 못해
+# 기록 전에 끝나 버리는 일이 없도록 (최종 리뷰 minor a). 신원 앞 200자 안에 표시가 들어가도록 스크립트는 파일로 둔다.
+cf_slow_exec_codex() { sleep 11; exec perl "$TMP/cf-wait-recorded.pl" "slow-exec-codex:$TMP"; }
 test_codex_identity_recorded_even_when_exec_is_late() {
   start_task
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/render.sh"
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
-  set_state '.calls_total = 1 | .running = {call_id: 1, kind: "plan", pgid: 1, supervisor_identity: "x|y",
-    codex_pid: null, codex_identity: null, started_at: "2026-01-01T00:00:00Z", review_tree: null}'
+  printf '%s\n' 'my $f = $ENV{CF_STATE_FILE};' \
+    'for (1 .. 150) { if (open my $h, "<", $f) { local $/; exit 0 if <$h> =~ /slow-exec-codex/ } select undef, undef, undef, 0.1 }' \
+    'exit 0' > "$TMP/cf-wait-recorded.pl"
+  export CF_STATE_FILE="$ACTIVE/state.json"
+  # 감독 프로세스 대역은 이 테스트 셸이다: running.pgid 를 이 셸($$)로 둔다 (감독 프로세스는 자기 기록만 고친다)
+  set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $$, supervisor_identity: \"x|y\",
+    codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
   _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"
   mkdir -p "$_CC_SUP_DIR"; printf '프롬프트\n' > "$_CC_SUP_DIR/prompt.md"
   CC_CODEX_BIN=cf_slow_exec_codex
@@ -429,8 +436,9 @@ test_timeout_fallback_kills_term_ignoring_codex() {
   . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
   # 테스트 전용 대역: 그룹 정리가 거부된 상황(ps 실패 등)을 만든다. 이 테스트 셸 안에서만 바뀐다
   cc_kill_own_group_members() { return 2; }
-  set_state '.calls_total = 1 | .running = {call_id: 1, kind: "plan", pgid: 1, supervisor_identity: "x|y",
-    codex_pid: null, codex_identity: null, started_at: "2026-01-01T00:00:00Z", review_tree: null}'
+  # 감독 프로세스 대역은 이 테스트 셸이다: running.pgid 를 이 셸($$)로 둔다 (감독 프로세스는 자기 기록만 고친다)
+  set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $$, supervisor_identity: \"x|y\",
+    codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
   _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_CLAIMED=1; _CC_SUP_TIMED_OUT=0
   mkdir -p "$_CC_SUP_DIR"; printf '프롬프트\n' > "$_CC_SUP_DIR/prompt.md"
   CC_CALL_TIMEOUT_SECS=1; _cc_sup_init_config
@@ -457,4 +465,73 @@ test_argv_build_failure_is_not_retried() {
   assert_not_contains "$(state .last_call.message)" "재시도"
   assert_eq "$(cf_invocations)" "0"
   assert_eq "$(state .calls_total)" "1"
+}
+
+# ---- 최종 리뷰 minor d: 감독 프로세스는 call_id 뿐 아니라 pgid 까지 자기 것인 running 만 고친다 ----
+#   (오래된 감독 프로세스가 같은 호출 번호를 쓰는 새 작업의 state 에 쓰지 않도록)
+cf_source_call() {
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/render.sh"
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
+}
+test_supervisor_leaves_same_call_id_with_other_pgid_untouched() {
+  start_task; cf_source_call
+  other=$(( $$ + 100000 ))
+  set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $other, supervisor_identity: \"x|y\",
+    codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
+  before=$(jq -cS 'del(.last_activity_at)' "$ACTIVE/state.json")
+  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; mkdir -p "$_CC_SUP_DIR"
+  _cc_sup_init_config; _CC_SUP_ATTEMPT=1
+  # codex 신원 기록
+  _cc_sup_set_codex_identity 4242 "Thu Jan  1 00:00:00 2020|codex" >/dev/null 2>&1
+  assert_eq "$(state .running.codex_pid)" "null" "codex 신원 기록"
+  # 재시도 호출 수 더하기
+  _cc_sup_next_attempt; rc=$?
+  assert_eq "$rc" "2" "재시도 거부 코드"
+  assert_eq "$(state .calls_total)" "1"
+  # 결과 반영
+  printf '%s\n' "$(cf_result approve 1)" > "$_CC_SUP_DIR/result.json"
+  _cc_sup_finish ok "" >/dev/null 2>&1
+  assert_eq "$(jq -cS 'del(.last_activity_at)' "$ACTIVE/state.json")" "$before" "state 가 바뀜"
+  # 같은 기록이 이 셸(pgid=$$)을 가리키면 평소처럼 반영한다
+  set_state ".running.pgid = $$"
+  _CC_SUP_FINAL=""; _cc_sup_finish ok "" >/dev/null 2>&1
+  assert_eq "$(state .running)" "null"
+  assert_eq "$(state .last_call.verdict)" "approve"
+}
+test_running_supervisor_does_not_finish_into_record_with_other_pgid() {
+  FAKE_CODEX_SEQ=slow; FAKE_CODEX_DELAY=3; start_task
+  run_cc call plan; assert_code 0
+  cf_until 5 cf_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid)
+  # 실행 중에 running 이 같은 번호의 다른 그룹 기록으로 바뀐다
+  cc_state_update ".running.pgid = $(( pg + 100000 ))" || _fail "state 갱신 실패"
+  wait_until_status_file 1 10 || _fail "status 파일이 생기지 않음"
+  cf_until 5 cf_group_gone "$pg" || _fail "감독 프로세스가 끝나지 않음"
+  assert_eq "$(state .running.call_id)" "1"
+  assert_eq "$(state .running.pgid)" "$(( pg + 100000 ))"
+  assert_eq "$(state .last_call)" "null"
+  assert_eq "$(state .tokens.output)" "0"
+  assert_eq "$(state .session_id)" "null"
+}
+
+# ---- 최종 리뷰 minor g: 호출 폴더를 지우기 전에 calls 나 그 번호 폴더가 심볼릭 링크면 거부한다 ----
+test_call_refuses_symlinked_calls_dir() {
+  start_task
+  mkdir -p "$TMP/elsewhere/1"; printf 'keep\n' > "$TMP/elsewhere/1/keep.txt"
+  rm -rf "$ACTIVE/calls"; ln -s "$TMP/elsewhere" "$ACTIVE/calls"
+  run_cc call plan; assert_code 1
+  assert_eq "$(cf_lines "$OUT")" "1"; assert_contains "$OUT" "비정상"
+  assert_file_exists "$TMP/elsewhere/1/keep.txt"
+  assert_eq "$(state .calls_total)" "0"; assert_eq "$(state .running)" "null"
+  assert_eq "$(cf_invocations)" "0"
+}
+test_call_refuses_symlinked_call_dir() {
+  start_task
+  mkdir -p "$TMP/elsewhere"; printf 'keep\n' > "$TMP/elsewhere/keep.txt"
+  ln -s "$TMP/elsewhere" "$ACTIVE/calls/1"
+  run_cc call plan; assert_code 1
+  assert_eq "$(cf_lines "$OUT")" "1"; assert_contains "$OUT" "비정상"
+  assert_file_exists "$TMP/elsewhere/keep.txt"
+  [ -L "$ACTIVE/calls/1" ] || _fail "심볼릭 링크가 사라짐"
+  assert_eq "$(state .calls_total)" "0"; assert_eq "$(cf_invocations)" "0"
 }

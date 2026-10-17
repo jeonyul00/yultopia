@@ -14,6 +14,7 @@
 #      그 PID 가 아예 없을 때만 끝난 것으로 본다). 살아 있거나 판단할 수 없는 대기자는 있는 것으로 본다.
 #   3) 지금 - 기준 시각 > CC_ORPHAN_GRACE_SECS. 기준 시각 = waiter_last_seen_at 과 running.started_at 중 늦은 쪽
 #      (이 호출을 한 번도 기다리지 않았으면 waiter_last_seen_at 은 앞 호출의 것이므로 호출 시작부터 센다).
+#      사용자가 직접 시킨 check-orphan --kill 은 3) 을 건너뛴다 (cc_is_orphan --no-grace). 1)·2) 는 그대로다.
 #   남은 그룹은 우리 것인지 확인할 수 없어 --kill 이어도 죽이지 않고, 사용자가 직접 볼 수 있게 PGID 와 ps 명령을 알린다.
 #
 # 삭제 (cleanup-stale, discard, finish): 확인된 <git-dir>/yultopia-cc/active 정확한 경로에만 (cc_delete_active).
@@ -87,10 +88,14 @@ _cc_hk_leftover_line() {
     "$1" "$_CC_HK_PG" "$_CC_HK_PG"
 }
 
-# cc_is_orphan : 0 = 고아 (CC_ORPHAN_* 에 결과) / 1 = 아님 (작업 없음·경로 비정상·읽기 실패 포함. 읽기 실패면 _CC_HK_RS=unreadable)
+# cc_is_orphan [--no-grace] : 0 = 고아 (CC_ORPHAN_* 에 결과) / 1 = 아님 (작업 없음·경로 비정상·읽기 실패 포함. 읽기 실패면 _CC_HK_RS=unreadable)
 #   $(...) 안에서 부르면 결과 변수가 사라지므로 직접 부른다. dead 기록은 정리한다. 아무것도 죽이지 않는다.
+#   --no-grace: 조건 3(유예)만 건너뛴다. 사용자가 직접 멈추라고 한 check-orphan --kill 만 쓴다 (최종 리뷰 Important 1:
+#     Esc 직후에는 유예 60초 동안 멈출 방법이 없었다). 대기자 조건(2)과 신원·그룹 확인은 그대로다.
+#     알리기만 하는 쪽(메시지 훅, 평소 check-orphan, preflight)은 유예를 지킨다.
 cc_is_orphan() {
-  local wp wid r grace age min id
+  local wp wid r grace age min id no_grace=0
+  [ "${1:-}" = --no-grace ] && no_grace=1
   CC_ORPHAN_LINE=""; CC_ORPHAN_KIND=""; CC_ORPHAN_CALL_ID=""; CC_ORPHAN_MINUTES=""; CC_ORPHAN_PGID=""
   _CC_HK_RS=""
   cc_active_exists && cc_active_path_safe || return 1
@@ -118,8 +123,10 @@ $(printf '%s' "$_CC_HK_ST" | jq -r '
     | ([t(.waiter_last_seen_at), $s] | map(select(type == "number"))) as $b
     | "\(if ($b | length) == 0 then "-" else (now - ($b | max) | floor) end) \(if $s == null then "?" else ((now - $s) / 60 | floor | if . < 0 then 0 else . end) end)"' 2>/dev/null)
 EOF
-  case "$age" in ''|-|*[!0-9-]*|?*-*) return 1 ;; esac
-  [ "$age" -gt "$grace" ] || return 1
+  if [ "$no_grace" = 0 ]; then
+    case "$age" in ''|-|*[!0-9-]*|?*-*) return 1 ;; esac
+    [ "$age" -gt "$grace" ] || return 1
+  fi
   case "$min" in ''|*[!0-9]*) min="?" ;; esac
   id=$_CC_HK_ID; _cc_hk_valid_id "$id" || id="?"
   CC_ORPHAN_CALL_ID=$id; CC_ORPHAN_MINUTES=$min; CC_ORPHAN_PGID=$_CC_HK_PG
@@ -174,17 +181,19 @@ _cc_hk_kill_orphan() {
 # cc-codex.sh check-orphan [--kill]
 #   고아가 아니면 출력 없이 0. 고아면 한 줄, 10. --kill 이면 검증 후 종료하고 결과 한 줄, 10.
 #   남은 그룹(확인할 수 없는 프로세스)은 --kill 이어도 죽이지 않고 안내 한 줄, 10.
+#   --kill 은 사용자가 직접 멈추라고 할 때만 SKILL 이 부른다: 유예(CC_ORPHAN_GRACE_SECS)를 기다리지 않는다.
+#   살아 있거나 판단할 수 없는 대기자가 있으면 --kill 이어도 아무것도 하지 않는다 (0, 출력 없음).
 cc_cmd_check_orphan() {
-  local kill=0
+  local kill=0 grace_opt=""
   case "$#:${1:-}" in
     0:) ;;
-    1:--kill) kill=1 ;;
+    1:--kill) kill=1; grace_opt=--no-grace ;;
     *) cc_line "[cc] 사용법: check-orphan [--kill]"; return 1 ;;
   esac
   cc_git_dir >/dev/null 2>&1 || return 0
   cc_active_exists || return 0
   cc_active_path_safe || { cc_line "[cc] 상태 폴더 경로가 비정상입니다."; return 1; }
-  if ! cc_is_orphan; then
+  if ! cc_is_orphan $grace_opt; then
     if [ "$_CC_HK_RS" = unreadable ]; then
       cc_line "[cc] 상태 파일을 읽을 수 없어 고아 Codex를 확인하지 못했습니다."
       return 1

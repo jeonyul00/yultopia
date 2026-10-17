@@ -116,6 +116,58 @@ test_init_concurrent_exactly_one_wins() {
     assert_eq "$(cat "$(cc_path brief)")" "$w" "round $round brief"
   done
 }
+# ---- 최종 리뷰 Important 2: init 도 시작 전 깨끗함 검사를 다시 한다 (인터뷰 동안 바뀐 파일) ----
+st_lines() { printf '%s\n' "$1" | wc -l | tr -d ' '; }
+test_init_refuses_dirty_tree_and_creates_nothing() {
+  repo=$(make_repo "my repo 한글"); cd "$repo"
+  gd=$(git rev-parse --absolute-git-dir)
+  # untracked (공백·한글 이름)
+  printf 'n\n' > "새 파일.txt"
+  printf '목표\n' | run_cc init; assert_code 8
+  assert_eq "$(st_lines "$OUT")" "1"
+  assert_contains "$OUT" "커밋되지 않은 변경이 1개"
+  assert_contains "$OUT" "새 파일.txt"
+  assert_no_path "$gd/yultopia-cc"
+  rm "새 파일.txt"
+  # 추적 중인 파일 수정
+  printf 'changed\n' > base.txt
+  printf '목표\n' | run_cc init; assert_code 8
+  assert_eq "$(st_lines "$OUT")" "1"; assert_contains "$OUT" "base.txt"
+  assert_no_path "$gd/yultopia-cc"
+  git checkout -q -- base.txt
+  # 스테이징만 된 새 파일
+  printf 's\n' > staged.txt; git add staged.txt
+  printf '목표\n' | run_cc init; assert_code 8
+  assert_contains "$OUT" "staged.txt"
+  assert_no_path "$gd/yultopia-cc"
+  git rm -q --cached staged.txt; rm staged.txt
+  # 깨끗해지면 시작된다
+  printf '목표\n' | run_cc init; assert_code 0
+}
+test_init_dirty_line_lists_at_most_ten_files_on_one_line() {
+  repo=$(make_repo); cd "$repo"
+  for i in 01 02 03 04 05 06 07 08 09 10 11 12; do printf 'x\n' > "f$i.txt"; done
+  printf $'줄\n바꿈' > "$(printf 'nl\nname.txt')"
+  printf '목표\n' | run_cc init; assert_code 8
+  assert_eq "$(st_lines "$OUT")" "1"
+  assert_contains "$OUT" "커밋되지 않은 변경이 13개"
+  assert_contains "$OUT" "외 3개"
+  assert_no_path "$(git rev-parse --absolute-git-dir)/yultopia-cc/active"
+}
+test_init_allows_ignored_only_changes() {
+  repo=$(make_repo); cd "$repo"
+  printf 'ignored.txt\n' > .gitignore; git add .gitignore; git commit -qm ign
+  printf 'x\n' > ignored.txt
+  printf '목표\n' | run_cc init; assert_code 0
+  assert_not_contains "$(git ls-tree -r --name-only "$(jq -r .task_base_tree "$(cc_path active)/state.json")")" "ignored.txt"
+}
+test_init_reports_active_before_dirty_tree() {
+  # 다른 세션이 먼저 시작해 작업 중이면 (그 변경 때문에 트리가 더러워도) "이미 진행 중" 이 먼저다
+  start_task
+  printf 'work\n' > work.txt
+  printf '두번째\n' | run_cc init; assert_code 4
+  assert_eq "$(cat "$(cc_path brief)")" "목표: 기본 정리본"
+}
 test_init_failure_cleans_up() {
   repo=$(make_repo); cd "$repo"
   run_cc init < /; assert_code 1

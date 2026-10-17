@@ -41,11 +41,14 @@
 #
 # 중단 처리 (INT/TERM/HUP. addendum A, B, Ruling R20)
 #   1) 두 번째 신호가 정리를 끊지 않도록 INT/TERM/HUP 을 무시로 바꾸고, 쥐고 있던 state 잠금이 있으면 놓는다
-#      (감독 프로세스의 마무리에 잠금이 필요하므로 잠금을 쥔 채 죽이지 않는다).
-#   2) 기다리던 호출이 아직 running 일 때만 멈춘다. 그 사이 끝났거나 다른 호출이 running 이면 아무것도 멈추지 않는다.
+#      (감독 프로세스의 마무리에 잠금이 필요하므로 잠금을 쥔 채 죽이지 않는다). 쥐지 않았으면 아무것도 하지 않는다.
+#   2) 기다리던 호출만 멈춘다. 첫 TERM 은 state 를 다시 읽지 않고, 확인할 때마다 기억해 둔 그 호출의 감독 프로세스
+#      (pgid·신원)에 신원 확인 뒤 바로 보낸다 (지연 줄이기). 그 감독 프로세스가 이미 없거나 판단할 수 없으면 그때
+#      state 를 읽어, 기다리던 호출이 아직 running 일 때만 멈춘다. 그 사이 끝났거나 다른 호출이 running 이면
+#      아무것도 멈추지 않는다 (다른 호출의 감독 프로세스는 신원이 달라 첫 TERM 도 가지 않는다).
 #   3) codex 만이 아니라 감독 프로세스 그룹 전체에 신호를 보낸다 (B: codex 만 죽으면 빠른 기술 오류처럼 보여 재실행된다).
 #      cc_kill_group_verified <pgid> <감독 프로세스 신원> 100: TERM 뒤 감독 프로세스가 스스로 멤버를 정리하고
-#      (중단 경로: 멤버 TERM 1초 + KILL 최대 2초) 상태를 기록하고 끝날 때까지 최대 10초 기다린다.
+#      (중단 경로: 멤버 TERM 3초 + KILL 최대 2초) 상태를 기록하고 끝날 때까지 최대 10초 기다린다.
 #      감독 프로세스가 끝났는데 그룹에 남은 것이 있거나 10초가 지나면 그때 그룹에 KILL.
 #      감독 프로세스가 이미 없으면 기록된 codex 신원으로 cc_kill_group_via_member.
 #   4) 끝냈으면 잠금 안에서: running.call_id 가 아직 이 호출일 때만 interrupted 로 기록하고 (감독 프로세스가 기록 전에
@@ -86,6 +89,24 @@ _cc_wait_read_state() { jq -ce 'select(type == "object")' "$_CC_WAIT_ACTIVE/stat
 # 이 state(JSON) 의 running 이 호출 <id> 인가
 _cc_wait_running_is() {
   [ "$(printf '%s' "$1" | jq -r --argjson id "$2" '(.running | type) == "object" and .running.call_id == $id' 2>/dev/null)" = true ]
+}
+
+# _cc_wait_running_cache <state-json> : running 이 기다리는 호출(_CC_WAIT_ID)이면 0. 그때 그 감독 프로세스(그룹 리더)의
+#   pgid 와 신원을 _CC_WAIT_C_PG / _CC_WAIT_C_SID 에 기억한다 (jq 한 번). 아니면 1 (기억은 그대로 둔다).
+#   중단 신호를 받으면 state 를 다시 읽지 않고 이 값으로 바로 검증된 TERM 을 보낸다 (최종 리뷰 Important 1: 지연 줄이기).
+#   같은 호출의 pgid·감독 프로세스 신원은 바뀌지 않으므로 어느 확인 때 기억한 값이든 같다.
+_cc_wait_running_cache() {
+  local out yes="" pg="" sid=""
+  out=$(printf '%s' "$1" | jq -r --argjson id "$_CC_WAIT_ID" '
+      if (.running | type) == "object" and .running.call_id == $id
+      then "yes", (.running.pgid // "" | tostring), (.running.supervisor_identity // "" | tostring)
+      else "no" end' 2>/dev/null)
+  { IFS= read -r yes; IFS= read -r pg; IFS= read -r sid; } <<EOF
+$out
+EOF
+  [ "$yes" = yes ] || return 1
+  _CC_WAIT_C_PG=$pg; _CC_WAIT_C_SID=$sid
+  return 0
 }
 
 # 잠금 안에서 state 를 고친다. last_activity_at 은 그대로 둔다 (대기자 기록 전용: 대기자는 Codex 활동이 아니다)
@@ -283,7 +304,7 @@ _cc_wait_run() {
   while :; do
     has=0; [ -s "$sf" ] && has=1
     st=$(_cc_wait_read_state) || { _CC_WAIT_LINE="[cc] 상태 파일을 읽을 수 없습니다."; _CC_WAIT_CODE=3; return; }
-    if ! _cc_wait_running_is "$st" "$id"; then
+    if ! _cc_wait_running_cache "$st"; then
       # state 상 끝났다. 감독 프로세스는 state 다음에 status 파일을 쓰므로 잠깐(최대 2초) 기다린 뒤 맞춘다
       if [ "$has" = 0 ]; then
         i=0; while [ ! -s "$sf" ] && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i + 1)); done
@@ -317,25 +338,38 @@ _cc_wait_stop_group() {
     case "$r2" in 0|3) return "$r2" ;; esac
   fi
   # 감독 프로세스도 codex 도 확실히 없을 때 그룹까지 비었으면 끝난 것. 그룹에 무언가 남아 있으면(codex 의 자식 등)
-  # 우리 것인지 확인할 수 없으므로 신호 없이 2 (신호 0 으로 있는지만 본다)
+  # 우리 것인지 확인할 수 없으므로 신호 없이 2 (신호 0 으로 있는지만 본다).
+  # 감독 프로세스 PID 를 신원이 다른 프로세스가 쓰고 있으면(재사용) 우리 그룹은 이미 끝났다: 그룹을 보지 않고 0
+  # (_cc_call_liveness 와 같은 판단, 최종 리뷰 minor e. 그 번호의 그룹이 있다면 그 다른 프로세스의 것이다)
   if [ "$r" -eq 1 ] && [ "$r2" -eq 1 ]; then
+    cc_proc_alive_detail "$pg" "$sid"; [ $? -eq 4 ] && return 0
     _cc_proc_probe "-$pg"; [ $? -eq 1 ] && return 0
   fi
   return 2
 }
 
 _cc_wait_interrupt() {
-  local st id pg sid cp cid r final="" i
+  local st id pg sid cp cid r=2
   _CC_WAIT_CODE=130
   id=$_CC_WAIT_ID
   if [ -z "$id" ]; then
     _CC_WAIT_LINE="[cc] 중단됨: 기다리던 Codex 호출은 없었습니다"; return 0
   fi
+  # 빠른 길: 마지막 확인 때 기억한 감독 프로세스(그룹 리더)에 state 를 다시 읽지 않고 바로 검증된 TERM.
+  #   신원·그룹 소속 확인은 cc_kill_group_verified 가 그대로 한다: 그 사이 감독 프로세스가 끝났거나 PID 가
+  #   재사용됐으면 아무 신호도 보내지 않는다(1). 마무리 중인 감독 프로세스는 TERM 을 무시하고 스스로 끝나며,
+  #   그 결과는 아래 정리(_cc_wait_settle)가 state 에서 그대로 읽는다.
+  if [ -n "${_CC_WAIT_C_PG:-}" ]; then
+    cc_kill_group_verified "$_CC_WAIT_C_PG" "$_CC_WAIT_C_SID" "$_CC_WAIT_SUP_GRACE_TENTHS"; r=$?
+  fi
+  case "$r" in
+    0|3) _cc_wait_interrupt_conclude "$id" "$r"; return 0 ;;
+  esac
+  # 느린 길 (감독 프로세스가 이미 없거나 판단할 수 없음): 지금 state 로 다시 판단한다
   st=$(_cc_wait_read_state)
   if ! _cc_wait_running_is "$st" "$id"; then
     # 기다리던 호출은 이미 끝났다 (다른 호출이 running 이어도 그것은 멈추지 않는다)
-    final=$(_cc_wait_settle "$id")
-    _CC_WAIT_LINE="[cc] 중단됨: Codex 호출 $id 은(는) 중단 전에 이미 끝나 있었습니다 (${final:-결과 확인 불가})"
+    _cc_wait_interrupt_conclude "$id" done
     return 0
   fi
   pg=$(_cc_jq_get "$st" '.running.pgid // empty | tostring')
@@ -343,7 +377,17 @@ _cc_wait_interrupt() {
   cp=$(_cc_jq_get "$st" '.running.codex_pid // empty | tostring')
   cid=$(_cc_jq_get "$st" '.running.codex_identity // empty')
   _cc_wait_stop_group "$pg" "$sid" "$cp" "$cid"; r=$?
+  _cc_wait_interrupt_conclude "$id" "$r"
+}
+
+# _cc_wait_interrupt_conclude <id> <0|3|2|done> : 중단 처리 결과를 state·status 파일에 맞추고 알릴 한 줄을 정한다
+#   0 끝냈음 / 3 KILL 뒤에도 남음 / done 신호 전에 이미 끝나 있었음 / 그 밖(2) 확인할 수 없어 아무것도 바꾸지 않음
+_cc_wait_interrupt_conclude() {
+  local id="$1" r="$2" final="" i
   case "$r" in
+    done)
+      final=$(_cc_wait_settle "$id")
+      _CC_WAIT_LINE="[cc] 중단됨: Codex 호출 $id 은(는) 중단 전에 이미 끝나 있었습니다 (${final:-결과 확인 불가})" ;;
     0)
       for i in 1 2 3; do
         final=$(_cc_wait_settle "$id" interrupted "$_CC_WAIT_INTERRUPTED_LINE") && break
@@ -369,13 +413,25 @@ _cc_wait_in_main_shell() {
   [ $? -ne 1 ]
 }
 
+# state 잠금의 owner 가 이 셸($$)인가 (bash 내장 read 만 쓴다). 잠금 owner 는 잠금을 잡은 셸의 PID 다 (state.sh)
+_cc_wait_owns_lock() {
+  local o="" f="$_CC_WAIT_ACTIVE/state.lock/owner"
+  [ -n "${_CC_WAIT_ACTIVE:-}" ] && [ -f "$f" ] || return 1
+  IFS= read -r o < "$f" 2>/dev/null
+  [ "$o" = "$$" ]
+}
+
 _cc_wait_on_signal() {
   trap '' INT TERM HUP
   # bash 3.2 는 신호가 막 도착했을 때 만들어진 $(...) 자식에서도 이 trap 을 실행한다 (대기 중이던 trap 을 물려받음).
   # 그 자식은 아무것도 하지 않고 조용히 끝난다. 본 셸도 같은 신호를 받아 두었으므로 자식이 끝나면 본 셸이 처리한다.
   _cc_wait_in_main_shell || exit 130
-  # 이 셸이 state 잠금을 쥐고 있었다면 놓는다 (주인이 자기일 때만 풀린다)
-  _CC_STATE_LOCK_DEPTH=1; cc_state_unlock 2>/dev/null
+  # 이 셸이 state 잠금을 쥐고 있었을 때만 놓는다 (감독 프로세스의 마무리에 잠금이 필요하다).
+  #   쥐었는지는 깊이 기록과 잠금 owner 파일로 본다 (프로세스를 띄우지 않는다): 잠금을 잡은 직후 깊이를 적기 전에
+  #   신호가 오면 깊이는 0 이지만 owner 는 이 셸이다. 쥐지 않았으면 아무것도 하지 않고 곧바로 TERM 으로 간다.
+  if [ "${_CC_STATE_LOCK_DEPTH:-0}" -gt 0 ] || _cc_wait_owns_lock; then
+    _CC_STATE_LOCK_DEPTH=1; cc_state_unlock 2>/dev/null
+  fi
   _cc_wait_interrupt
   _cc_wait_unregister
   cc_line "$_CC_WAIT_LINE"
@@ -390,6 +446,7 @@ _cc_wait_on_exit() {
 cc_cmd_wait() {
   local max st
   _CC_WAIT_REG=0; _CC_WAIT_ID=""; _CC_WAIT_IDENT=""; _CC_WAIT_STARTED_AT=""; _CC_WAIT_LINE=""; _CC_WAIT_CODE=3
+  _CC_WAIT_C_PG=""; _CC_WAIT_C_SID=""
   max=$(_cc_wait_parse_max "$@") || { cc_line "[cc] 사용법: wait [--max SECS]"; return 3; }
   cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다."; return 3; }
   cc_active_path_safe || { cc_line "[cc] 상태 폴더 경로가 비정상입니다."; return 3; }
@@ -400,6 +457,8 @@ cc_cmd_wait() {
   case "$_CC_WAIT_ID" in
     0*|*[!0-9]*|??????????*) cc_line "[cc] 상태 파일의 호출 기록이 올바르지 않습니다."; return 3 ;;
   esac
+  # 첫 확인 전에 신호가 와도 바로 TERM 을 보낼 수 있게 감독 프로세스를 기억해 둔다
+  [ -n "$_CC_WAIT_ID" ] && _cc_wait_running_cache "$st"
   trap '_cc_wait_on_signal' INT TERM HUP
   trap '_cc_wait_on_exit' EXIT
   _cc_wait_register

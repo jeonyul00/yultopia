@@ -55,17 +55,21 @@ test_init_records_task_base_tree() {
   assert_eq "$(state_of_repo)" "$(git rev-parse 'HEAD^{tree}')"
 }
 state_of_repo() { jq -r .task_base_tree "$(cc_path active)/state.json"; }
-test_init_task_base_tree_includes_dirty_files() {
+test_init_refuses_dirty_files_instead_of_snapshotting_them() {
+  # 최종 리뷰 Important 2: 더러운 작업 트리는 기준 스냅샷에 섞지 않고 init 이 거부한다 (8)
   repo=$(make_repo); cd "$repo"; printf 'd\n' > dirty.txt
-  printf 'g\n' | run_cc init; assert_code 0
-  t=$(state_of_repo)
-  assert_contains "$(git ls-tree -r --name-only "$t")" "dirty.txt"
+  printf 'g\n' | run_cc init; assert_code 8
+  assert_contains "$OUT" "dirty.txt"
+  assert_no_path "$(git rev-parse --absolute-git-dir)/yultopia-cc/active"
 }
 test_init_fails_cleanly_when_snapshot_fails() {
+  # 깨끗한 트리에서 스냅샷만 실패하게 한다: write-tree 만 실패하는 git 대역
   repo=$(make_repo); cd "$repo"
-  printf 'secret\n' > unreadable.txt; chmod 000 unreadable.txt
-  printf 'g\n' | run_cc init; rc=$CODE; cc_last
-  chmod 644 unreadable.txt
+  real_git=$(command -v git)
+  mkdir -p "$TMP/bin"
+  printf '#!/bin/sh\n[ "$1" = write-tree ] && exit 1\nexec "%s" "$@"\n' "$real_git" > "$TMP/bin/git"
+  chmod +x "$TMP/bin/git"
+  printf 'g\n' | PATH="$TMP/bin:$PATH" run_cc init; rc=$CODE; cc_last
   assert_eq "$CODE" "1"
   assert_contains "$OUT" "작업을 시작하지 못했습니다"
   assert_no_path "$(git rev-parse --absolute-git-dir)/yultopia-cc/active"

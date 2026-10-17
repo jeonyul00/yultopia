@@ -470,3 +470,21 @@ test_cli_fails_loudly_without_proc_lib() {
   assert_eq "$rc" "1"
   assert_contains "$out" "proc.sh"
 }
+# ---- 최종 리뷰 minor e: "없음" 과 "PID 재사용" 을 나눠 알려 주는 확인 ----
+test_alive_detail_separates_absent_and_reused() {
+  pg=$(cc_spawn_group "$TMP/log" bash -c 'sleep 30; :' "cc-test-$TMP")
+  id=$(cc_proc_identity "$pg")
+  assert_code_of 0 cc_proc_alive_detail "$pg" "$id"
+  # 명령줄부터 다르면 재사용이 분명하다 (4)
+  assert_code_of 4 cc_proc_alive_detail "$pg" "${id%%|*}|bash -c something-else"
+  assert_code_of 4 cc_proc_alive_detail "$pg" "Thu Jan  1 00:00:00 1970|bash -c something-else"
+  # 시작 시각만 다르면(시간대 차이일 수도 있음) 재사용으로 단정하지 않는다 (1: 호출한 쪽이 그룹을 확인)
+  assert_code_of 1 cc_proc_alive_detail "$pg" "Thu Jan  1 00:00:00 1970|${id#*|}"
+  assert_code_of 2 cc_proc_alive_detail "$pg" "no-bar"
+  assert_code_of 2 cc_proc_alive_detail "x1" "$id"
+  bash -c 'exit 0' & dead=$!; wait "$dead"
+  assert_code_of 1 cc_proc_alive_detail "$dead" "$id"
+  # cc_proc_alive_verified 의 계약(R8)은 그대로: 재사용도 1
+  assert_code_of 1 cc_proc_alive_verified "$pg" "${id%%|*}|bash -c something-else"
+  proc_reap "$pg"
+}

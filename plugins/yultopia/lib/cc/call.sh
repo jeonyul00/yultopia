@@ -3,7 +3,7 @@
 #
 # 흐름
 #   call <plan|review|message>  (Claude 가 부르는 셸)
-#     1) 거부 조건·입력 파일 확인 → review 면 작업 트리 스냅샷
+#     1) 거부 조건·입력 파일 확인 → review 면 작업 트리 스냅샷 (done 뒤의 message 도: 새 마일스톤의 기준)
 #     2) state 잠금 안에서: 거부 조건 재확인 → calls/<n>/prompt.md 생성
 #        → 감독 프로세스를 새 프로세스 그룹으로 실행 → calls_total=n, running={…, pgid, supervisor_identity} 기록
 #           (실행 중 단계: plan → phase=planning, review → phase=reviewing, message 는 그대로)
@@ -117,14 +117,17 @@ _cc_call_read_state() {
 #   call·wait·check-orphan·cleanup-stale·discard·finish·preflight 가 모두 이 하나로 판단한다 (Task 8 addendum B).
 #   _CC_LIVENESS = none      running 이 null (실행 중인 호출이 없다고 명시돼 있음)
 #                | alive     기록된 감독 프로세스나 codex 중 하나라도 신원 확인상 살아 있음
-#                | dead      둘 다 확실히 없고(R8 의 1: 없음·PID 재사용) 그 그룹도 확실히 비었음
-#                | uncertain 그 밖: ps 실패, 기록 형식 오류, 또는 둘 다 확실히 없는데 그룹이 비어 있지 않거나 판단 불가
+#                | dead      둘 다 확실히 없고(R8 의 1: 없음·PID 재사용) 그 그룹도 확실히 비었음.
+#                            감독 프로세스(그룹 리더) PID 를 신원이 다른 프로세스가 쓰고 있으면 그룹을 보지 않고 비었다고 본다:
+#                            PID 는 같은 번호의 그룹이 있는 동안 재사용되지 않으므로 우리 그룹은 이미 끝났다 (그 번호의 그룹이
+#                            지금 있다면 그 다른 프로세스의 것이다. 최종 리뷰 minor e)
+#                | uncertain 그 밖: ps 실패, 기록 형식 오류, 또는 리더가 없는데 그룹이 비어 있지 않거나 판단 불가
 #   _CC_LIVENESS_LEFTOVER = 1 : uncertain 중 "감독 프로세스·codex 는 확실히 없는데 그룹에 무언가 남아 있음"
 #     (codex 의 자식, 기록 전에 실행된 codex 등. 우리 것인지 확인할 수 없으므로 죽이지 않는다: R8)
 #   _CC_LIVENESS_PGID = 기록된 pgid (형식 확인 전 값)
 #   그룹은 신호 0 으로 있는지만 본다 (아무것도 보내지 않음). $(...) 안에서 부르면 결과 변수가 사라진다.
 _cc_call_liveness() {
-  local st="$1" pg sid cp cid r1 r2=1
+  local st="$1" pg sid cp cid r1 r2=1 reused=0
   _CC_LIVENESS=uncertain; _CC_LIVENESS_LEFTOVER=0; _CC_LIVENESS_PGID=""
   if [ "$(_cc_jq_get "$st" '.running == null')" = "true" ]; then
     _CC_LIVENESS=none; return 0
@@ -134,7 +137,8 @@ _cc_call_liveness() {
   cp=$(_cc_jq_get "$st" '.running.codex_pid // empty | tostring')
   cid=$(_cc_jq_get "$st" '.running.codex_identity // empty')
   _CC_LIVENESS_PGID=$pg
-  cc_proc_alive_verified "$pg" "$sid"; r1=$?
+  cc_proc_alive_detail "$pg" "$sid"; r1=$?
+  [ "$r1" -eq 4 ] && { r1=1; reused=1; }
   if [ -n "$cp" ]; then
     cc_proc_alive_verified "$cp" "$cid"; r2=$?
   fi
@@ -142,6 +146,10 @@ _cc_call_liveness() {
     _CC_LIVENESS=alive; return 0
   fi
   if [ "$r1" -eq 1 ] && [ "$r2" -eq 1 ]; then
+    # 리더 PID 를 다른 프로세스가 쓴다 = 우리 그룹은 이미 끝났다 (그룹 확인은 그 다른 프로세스의 그룹을 볼 뿐이다)
+    if [ "$reused" = 1 ]; then
+      _CC_LIVENESS=dead; return 0
+    fi
     # r1 이 1 이면 pg 는 형식이 맞는 PID 다 (형식 오류는 2)
     _cc_proc_probe "-$pg"
     case $? in
@@ -202,7 +210,7 @@ _cc_call_refusal() {
 # _cc_call_render <kind> <active> <out> <state-json> <review_tree>
 #   파일 내용은 렌더 하는 서브셸에서만 CC_T_* 환경변수로 넘긴다.
 _cc_call_render() {
-  local kind="$1" a="$2" out="$3" st="$4" rt="$5" v ms mbase tbase
+  local kind="$1" a="$2" out="$3" st="$4" rt="$5" v ms mbase tbase ph
   case "$kind" in
     plan)
       v=$(cat "$a/brief.md") || return 1
@@ -218,7 +226,9 @@ _cc_call_render() {
     message)
       v=$(cat "$a/message.md") || return 1
       ms=$(_cc_jq_get "$st" '.milestone // "?" | tostring')
-      ( export CC_T_MESSAGE="$v" CC_T_MILESTONE="$ms"; cc_render "$CC_PROMPT_DIR/pm-message.md" "$out" ) ;;
+      ph=$(_cc_jq_get "$st" '.phase // "?" | tostring')
+      ( export CC_T_MESSAGE="$v" CC_T_MILESTONE="$ms" CC_T_PHASE="$ph"
+        cc_render "$CC_PROMPT_DIR/pm-message.md" "$out" ) ;;
     *) return 1 ;;
   esac
 }
@@ -230,6 +240,11 @@ _cc_call_start_locked() {
   _cc_call_refusal "$kind" "$st" || return $?
   n=$(( $(_cc_jq_get "$st" '.calls_total') + 1 ))
   dir="$a/calls/$n"
+  # calls 나 그 번호 폴더가 심볼릭 링크면 active 밖을 지우거나 쓰게 되므로 거부한다 (최종 리뷰 minor g)
+  if [ -L "$a/calls" ] || [ -L "$dir" ]; then
+    cc_line "[cc] 호출 기록 폴더 경로가 비정상이라 Codex를 호출하지 않았습니다."
+    return 1
+  fi
   # 같은 번호 폴더가 있으면 앞서 실패한 시도의 찌꺼기다 (calls_total 이 늘지 않았으므로 아무도 쓰지 않는다)
   rm -rf "$dir"
   mkdir -p "$dir" || { cc_line "[cc] 호출 폴더를 만들지 못했습니다."; return 1; }
@@ -246,10 +261,13 @@ _cc_call_start_locked() {
   # 신원을 못 얻으면 running 을 기록하지 않는다 → 감독 프로세스는 기록을 기다리다 codex 없이 끝난다.
   ident=$(cc_proc_identity "$pgid") || { cc_line "[cc] 감독 프로세스를 확인하지 못했습니다."; return 1; }
   now=$(cc_now_iso)
+  # review_tree = 검수할 작업 트리 (review). done 뒤의 message 는 그때의 트리를 next_base_tree 로 둔다
+  #   (추가 수정 요구 = 새 마일스톤의 기준. 감독 프로세스가 결과를 반영할 때 milestone_base_tree 로 쓴다)
   if ! cc_state_update '.calls_total = $n
-      | .running = {call_id: $n, kind: $kind, pgid: $pg, supervisor_identity: $ident,
+      | .running = ({call_id: $n, kind: $kind, pgid: $pg, supervisor_identity: $ident,
                     codex_pid: null, codex_identity: null, started_at: $now,
-                    review_tree: (if $rt == "" then null else $rt end)}
+                    review_tree: (if $kind == "review" and $rt != "" then $rt else null end)}
+                    + (if $kind == "message" and $rt != "" and .phase == "done" then {next_base_tree: $rt} else {} end))
       | .phase = (if $kind == "review" then "reviewing" elif $kind == "plan" then "planning" else .phase end)' \
       --argjson n "$n" --arg kind "$kind" --argjson pg "$pgid" --arg ident "$ident" --arg now "$now" --arg rt "$rt"; then
     cc_kill_group_verified "$pgid" "$ident" >/dev/null 2>&1
@@ -277,7 +295,8 @@ cc_cmd_call() {
     review)  [ -s "$a/report.md" ]  || { cc_line "[cc] 구현 보고(report.md)가 없어 검수를 요청할 수 없습니다."; return 1; } ;;
     message) [ -s "$a/message.md" ] || { cc_line "[cc] 전달할 메시지(message.md)가 없습니다."; return 1; } ;;
   esac
-  if [ "$kind" = review ]; then
+  # review: 검수할 작업 트리. done 뒤의 message(추가 수정 요구, 스펙 3-5 의 5): 새 마일스톤의 기준이 될 지금 트리
+  if [ "$kind" = review ] || { [ "$kind" = message ] && [ "$(_cc_jq_get "$st" '.phase')" = done ]; }; then
     rt=$(cc_snapshot_tree) && [ -n "$rt" ] || { cc_line "[cc] 작업 트리 스냅샷을 만들지 못했습니다."; return 1; }
   fi
   cc_state_lock || { cc_line "[cc] 상태 파일이 잠겨 있어 Codex를 호출하지 못했습니다."; return 1; }
@@ -341,12 +360,13 @@ _cc_sup_handshake() {
   return 1
 }
 
-# codex_pid / codex_identity 를 state 에 쓴다 (running 이 아직 이 호출일 때만). 0 = 썼거나 쓸 필요 없음
+# codex_pid / codex_identity 를 state 에 쓴다 (running 이 아직 이 호출이고 그 pgid 가 이 감독 프로세스일 때만:
+#   최종 리뷰 minor d. 같은 호출 번호를 쓰는 다른 기록에는 쓰지 않는다). 0 = 썼거나 쓸 필요 없음
 _cc_sup_set_codex_identity() {
   _CC_SUP_CODEX_IDENT="$2"
-  cc_state_update 'if (.running != null and .running.call_id == $id)
+  cc_state_update 'if ((.running | type) == "object" and .running.call_id == $id and .running.pgid == $me)
                    then .running.codex_pid = $pid | .running.codex_identity = $ident else . end' \
-    --argjson id "$_CC_SUP_ID" --argjson pid "$1" --arg ident "$2" && return 0
+    --argjson id "$_CC_SUP_ID" --argjson me "$$" --argjson pid "$1" --arg ident "$2" && return 0
   _cc_sup_log "codex 신원 기록 실패 (다시 시도함)"
   return 1
 }
@@ -499,12 +519,12 @@ _cc_sup_run_codex() {
 
 # _cc_sup_next_attempt : 재시도 한 번을 호출 수에 더한다 (Ruling R3). 잠금 안에서 확인하고 더한다.
 #   0 = calls_total 을 1 늘리고 _CC_SUP_ATTEMPT 를 다음 번호로 / 1 = 호출 상한이라 더하지 않음
-#   2 = running 이 더 이상 이 호출이 아니거나 state 를 읽고 쓰지 못함
+#   2 = running 이 더 이상 이 호출(call_id 와 pgid=$$)이 아니거나 state 를 읽고 쓰지 못함
 _cc_sup_next_attempt() {
   local r rc=2
   cc_state_lock || return 2
-  r=$(jq -r --argjson id "$_CC_SUP_ID" --argjson max "$_CC_SUP_MAX_CALLS" '
-        if (.running | type) == "object" and .running.call_id == $id
+  r=$(jq -r --argjson id "$_CC_SUP_ID" --argjson me "$$" --argjson max "$_CC_SUP_MAX_CALLS" '
+        if (.running | type) == "object" and .running.call_id == $id and .running.pgid == $me
            and (.calls_total | type) == "number" and .calls_total >= 0 and .calls_total == (.calls_total | floor)
         then (if .calls_total < $max then "ok" else "cap" end) else "no" end' "$_CC_SUP_ACTIVE/state.json" 2>/dev/null)
   case "$r" in
@@ -555,19 +575,34 @@ _cc_sup_write_status() {
   { printf '%s\n' "$1" > "$tmp" && mv -f "$tmp" "$_CC_SUP_DIR/status"; } || _cc_sup_log "status 파일을 쓰지 못함"
 }
 
-# state 반영 필터. running 이 아직 이 호출일 때만 바꾼다 (그 사이 wait 의 중단 처리 등으로 running 이
-# 바뀌었으면 덮어쓰지 않는다). 그래서 같은 호출을 두 번 반영해도 두 번째는 아무것도 바꾸지 않는다(토큰 중복 없음).
+# state 반영 필터. running 이 아직 이 호출(call_id 와 pgid = 이 감독 프로세스 $me)일 때만 바꾼다 (그 사이 wait 의
+# 중단 처리 등으로 running 이 바뀌었거나, 같은 호출 번호를 쓰는 다른 감독 프로세스의 기록이면 덮어쓰지 않는다: 최종 리뷰
+# minor d). 그래서 같은 호출을 두 번 반영해도 두 번째는 아무것도 바꾸지 않는다(토큰 중복 없음).
 # Ruling R27: 마일스톤을 승인·반려하는 것은 review 호출의 결과뿐이다. message 호출(사용자 말·Claude 반대 의견 전달)은
 # diff 를 검수하지 않으므로 그 결과는 "이어가기" 다:
 #   - approve: 마일스톤 번호·milestone_base_tree·rejects_in_row 를 그대로 둔다 (Codex 가 다른 번호를 말해도 지금
 #     마일스톤을 유지하고 다음 review 가 정한다). 아직 마일스톤이 없을 때(계획 호출이 세션만 남기고 실패)만 Codex 번호를 쓴다.
 #   - reject: 연속 반려로 세지 않는다.
-#   - plan 이 함께 오면 milestones_total 만 갱신. plan·done·ask_user verdict 는 review 와 같다.
+#   - done: 작업 완료가 아니다 (검수하지 않았다) → phase working (최종 리뷰 minor b. SKILL 은 이어가기로 다룬다).
+#   - plan 이 함께 오면 milestones_total 만 갱신. plan·ask_user verdict 는 review 와 같다.
+# done 뒤의 message (running.next_base_tree 있음 = 추가 수정 요구, 스펙 3-5 의 5, 최종 리뷰 minor c): plan 이 아닌 모든 verdict 는
+#   새 마일스톤을 연다. milestone = Codex 가 준 번호가 지금보다 크면 그 번호, 아니면 지금 + 1. milestone_base_tree =
+#   메시지 호출 때의 작업 트리 (다음 검수가 새 작업만 diff 하도록), rejects_in_row = 0, milestones_total 은 모자라면 늘린다.
+#   ask_user 면 phase asking (질문에 답한 뒤에도 같은 새 마일스톤·기준), 그 밖에는 working.
 _CC_SUP_FINISH_FILTER='
+def after_done($r):
+  (.milestone // 0) as $cur
+  | .milestone = (if ($r.milestone | type) == "number" and $r.milestone > $cur then $r.milestone else $cur + 1 end)
+  | .milestone_base_tree = .running.next_base_tree
+  | .rejects_in_row = 0
+  | (if $r.plan != null then .milestones_total = ($r.plan.milestones | length) else . end)
+  | (if (.milestones_total | type) == "number" and .milestones_total >= .milestone then . else .milestones_total = .milestone end)
+  | .phase = (if $r.verdict == "ask_user" then "asking" else "working" end);
 def apply_verdict($r; $kind):
   if $r.verdict == "plan" then
     .milestone = 1 | .milestones_total = ($r.plan.milestones | length)
     | .milestone_base_tree = .task_base_tree | .phase = "working"
+  elif $kind == "message" and (.running.next_base_tree | type) == "string" then after_done($r)
   elif $r.verdict == "approve" and $kind == "message" then
     .milestone = (.milestone // $r.milestone) | .phase = "working"
     | (if $r.plan != null then .milestones_total = ($r.plan.milestones | length) else . end)
@@ -579,9 +614,9 @@ def apply_verdict($r; $kind):
   elif $r.verdict == "reject" then
     (if $kind == "message" then . else .rejects_in_row = ((.rejects_in_row // 0) + 1) end) | .phase = "working"
     | (if $r.plan != null then .milestones_total = ($r.plan.milestones | length) else . end)
-  elif $r.verdict == "done" then .phase = "done"
+  elif $r.verdict == "done" then .phase = (if $kind == "message" then "working" else "done" end)
   else .phase = "asking" end;
-if (.running != null and .running.call_id == $id) then
+if ((.running | type) == "object" and .running.call_id == $id and .running.pgid == $me) then
     .tokens = {input: ((.tokens.input // 0) + $ti), cached_input: ((.tokens.cached_input // 0) + $tc),
                output: ((.tokens.output // 0) + $to)}
     | (if $sid != "" then .session_id = $sid else . end)
@@ -598,18 +633,19 @@ if (.running != null and .running.call_id == $id) then
 #   state 가 이 호출을 어떻게 기록하고 있는지 그 자리에서 읽는다 (addendum A: status 파일은 state 와 같아야 한다).
 #   _CC_SUP_REC = 이 호출의 최종 status
 #     - running 이 이 호출이 아니고 last_call 이 이 호출이면 → last_call.status (이 반영이든, 먼저 기록한 다른 쪽이든)
-#     - state 가 이 호출을 더 이상 추적하지 않으면 → <st>
-#   반환 1 = 잠금을 못 잡았거나 반영하지 못해 running 이 아직 이 호출 (다시 시도할 것)
+#     - state 가 이 호출을 더 이상 추적하지 않거나, running 이 같은 번호의 다른 감독 프로세스 기록이면 → <st>
+#   반환 1 = 잠금을 못 잡았거나 반영하지 못해 running 이 아직 이 호출(call_id·pgid 모두) (다시 시도할 것)
 _cc_sup_record_result() {
   local st="$1" msg="$2" sid="$3" ti="$4" tc="$5" to="$6" r
   shift 6
   _CC_SUP_REC=""
   cc_state_lock || return 1
-  _cc_state_update_nolock "$_CC_SUP_FINISH_FILTER" --argjson id "$_CC_SUP_ID" --arg st "$st" --arg msg "$msg" \
+  _cc_state_update_nolock "$_CC_SUP_FINISH_FILTER" --argjson id "$_CC_SUP_ID" --argjson me "$$" --arg st "$st" --arg msg "$msg" \
     --arg sid "$sid" --argjson ti "${ti:-0}" --argjson tc "${tc:-0}" --argjson to "${to:-0}" "$@" \
     || _cc_sup_log "state 반영 실패"
-  r=$(jq -r --argjson id "$_CC_SUP_ID" '
-        if (.running | type) == "object" and .running.call_id == $id then "@running"
+  r=$(jq -r --argjson id "$_CC_SUP_ID" --argjson me "$$" '
+        if (.running | type) == "object" and .running.call_id == $id and .running.pgid == $me then "@running"
+        elif (.running | type) == "object" and .running.call_id == $id then "@other"
         elif (.last_call | type) == "object" and .last_call.call_id == $id
           and (.last_call.status | type) == "string" and (.last_call.status | test("^[a-z_]+$"))
           then .last_call.status
@@ -685,13 +721,10 @@ _cc_sup_on_exit() {
     msg="[cc] Codex 감독 프로세스가 예기치 않게 끝났습니다 (코드 $rc)."
   fi
   _cc_sup_log "비정상 종료 → $st"
-  # 중단 신호면 멤버도 대개 같은 TERM 을 이미 받았다 (wait 는 그룹 전체에 보낸다). TERM 뒤 1초만 기다리고 KILL 해서
-  # 기다리는 쪽(wait)이 KILL 하기 전에 마무리(state·status 기록)를 끝낸다 (Task 7 addendum A)
-  if [ -n "$_CC_SUP_SIGNAL" ]; then
-    _cc_sup_stop_group "$_CC_SUP_CODEX_PID" 1
-  else
-    _cc_sup_stop_group "$_CC_SUP_CODEX_PID"
-  fi
+  # 중단 신호여도 시간 상한 때와 같이 TERM 뒤 최대 3초를 준다: codex 가 따로 띄운 MCP 도우미를 스스로 정리할 시간이다
+  # (최종 리뷰 minor f). 멤버 TERM 3초 + KILL 최대 2초 + 기록이 기다리는 쪽(wait·check-orphan --kill)의
+  # 감독 프로세스 유예 10초(_CC_WAIT_SUP_GRACE_TENTHS) 안에 끝나므로 마무리 도중 KILL 되지 않는다 (Task 7 addendum A)
+  _cc_sup_stop_group "$_CC_SUP_CODEX_PID"
   _cc_sup_finish "$st" "$msg"
 }
 

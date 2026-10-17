@@ -18,8 +18,27 @@ cc_init_fail() {
   return 1
 }
 
+# 작업 트리가 깨끗한지 init 에서도 다시 본다 (preflight 와 같은 _cc_hk_dirty_scan, 최종 리뷰 Important 2).
+#   인터뷰하는 동안 파일이 바뀌었을 수 있다. 기존 변경이 섞이면 /cc 변경과 구분할 수 없으므로 시작하지 않는다.
+#   0 깨끗함 / 8 변경 있음(한 줄: 개수와 최대 10개 파일) / 1 확인 실패(한 줄)
+_cc_init_require_clean_tree() {
+  local top="$1" list="" f n
+  if ! _cc_hk_dirty_scan "$top"; then
+    cc_line "[cc] 작업 트리 상태를 확인하지 못해 작업을 시작하지 않았습니다."
+    return 1
+  fi
+  [ "$_CC_HK_DIRTY_N" -gt 0 ] || return 0
+  for f in "${_CC_HK_DIRTY[@]}"; do list="${list:+$list, }$f"; done
+  n=$((_CC_HK_DIRTY_N - ${#_CC_HK_DIRTY[@]}))
+  [ "$n" -gt 0 ] && list="$list 외 ${n}개"
+  # 파일 이름의 줄바꿈·제어 문자는 ? 로 바꿔 언제나 한 줄로 끝낸다 (R7)
+  list=$(printf '%s' "$list" | LC_ALL=C tr '\000-\037\177' '?')
+  cc_line "[cc] 커밋되지 않은 변경이 ${_CC_HK_DIRTY_N}개 있어 작업을 시작하지 않았습니다 (기존 변경과 /cc 변경을 구분할 수 없음): $list"
+  return 8
+}
+
 cc_cmd_init() {
-  local root active top now tmp base_tree
+  local root active top now tmp base_tree rc
   cc_git_dir >/dev/null || { cc_line "[cc] git 저장소가 아닙니다."; return 1; }
   root=$(cc_root_dir)
   active=$(cc_active_dir)
@@ -27,6 +46,16 @@ cc_cmd_init() {
     cc_line "[cc] 상태 폴더 경로가 비정상입니다."
     return 1
   fi
+  # 다른 세션의 작업이 먼저 있으면 그것을 알린다 (그 작업의 변경 때문에 트리가 더러울 수 있다). 최종 판단은 아래 mkdir
+  if [ -e "$active" ] || [ -L "$active" ]; then
+    cc_line "[cc] 이미 진행 중인 작업이 있습니다."
+    return 4
+  fi
+  # 변경이 있으면 아무것도 만들지 않고 8 (상태 폴더도 만들지 않는다)
+  top=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n "$top" ] || {
+    cc_line "[cc] 작업 트리 위치를 찾지 못해 작업을 시작하지 않았습니다."; return 1; }
+  _cc_init_require_clean_tree "$top"; rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   mkdir -p "$root" 2>/dev/null || { cc_line "[cc] 상태 폴더를 만들지 못했습니다."; return 1; }
   # 원자적 생성: 동시에 시작해도 한 쪽만 성공한다
   if ! mkdir "$active" 2>/dev/null; then
@@ -40,7 +69,6 @@ cc_cmd_init() {
   # 여기부터 이 실행이 active 를 소유한다
   cc_active_path_safe || { rmdir "$active" 2>/dev/null; cc_line "[cc] 상태 폴더 경로가 비정상입니다."; return 1; }
   cat > "$active/brief.md" || { cc_init_fail "brief.md 를 쓰지 못했습니다"; return 1; }
-  top=$(git rev-parse --show-toplevel 2>/dev/null) || top=$(pwd -P)
   now=$(cc_now_iso)
   base_tree=$(cc_snapshot_tree) && [ -n "$base_tree" ] || { cc_init_fail "작업 트리 스냅샷 실패"; return 1; }
   tmp=$(mktemp "$active/.state.XXXXXX") || { cc_init_fail "임시 파일 생성 실패"; return 1; }

@@ -31,8 +31,8 @@ test_render_empty_value_counts_as_set() {
 }
 test_render_all_templates() {
   CC_T_BRIEF=b CC_T_REPORT=r CC_T_MILESTONE=2 CC_T_MILESTONE_BASE_TREE=aaa CC_T_REVIEW_TREE=bbb \
-    CC_T_TASK_BASE_TREE=ccc CC_T_VERIFY_DIR=/v CC_T_MESSAGE=m
-  export CC_T_BRIEF CC_T_REPORT CC_T_MILESTONE CC_T_MILESTONE_BASE_TREE CC_T_REVIEW_TREE CC_T_TASK_BASE_TREE CC_T_VERIFY_DIR CC_T_MESSAGE
+    CC_T_TASK_BASE_TREE=ccc CC_T_VERIFY_DIR=/v CC_T_MESSAGE=m CC_T_PHASE=done
+  export CC_T_BRIEF CC_T_REPORT CC_T_MILESTONE CC_T_MILESTONE_BASE_TREE CC_T_REVIEW_TREE CC_T_TASK_BASE_TREE CC_T_VERIFY_DIR CC_T_MESSAGE CC_T_PHASE
   for t in pm-plan pm-review pm-message pm-format-retry; do
     cc_render "$TPL_DIR/$t.md" "$TMP/o-$t"; assert_eq "$?" 0 "$t"
     assert_not_contains "$(cat "$TMP/o-$t")" "{{"
@@ -63,5 +63,9 @@ test_prompts_state_pm_rules() {
   assert_contains "$m" "verdict \"approve\""
   assert_contains "$m" "verdict \"ask_user\""
   assert_contains "$m" "plan 에"
+  # 최종 리뷰 minor c: done 뒤의 메시지는 추가 수정 요구 = 새 마일스톤
+  assert_contains "$m" "지금 단계: {{PHASE}}"
+  assert_contains "$m" "추가 수정 요구"
+  assert_contains "$m" "새 마일스톤"
   assert_contains "$(cat "$TPL_DIR/pm-format-retry.md")" "JSON"
 }
