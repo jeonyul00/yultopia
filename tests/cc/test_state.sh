@@ -142,3 +142,55 @@ test_defaults_come_from_common() {
   assert_eq "$CC_MAX_REJECTS" "3"
   assert_eq "$CC_STALE_DAYS" "14"
 }
+
+# ---- state.json 잠금 (Ruling R11) ----
+test_state_update_concurrent_writers_lose_nothing() {
+  start_task
+  for i in $(seq 1 20); do
+    ( cc_state_update ".f$i = $i" || : > "$TMP/.update_failed.$i" ) &
+  done
+  wait
+  for i in $(seq 1 20); do
+    assert_eq "$(state ".f$i")" "$i" "f$i"
+    assert_no_path "$TMP/.update_failed.$i"
+  done
+  assert_no_path "$ACTIVE/state.lock"
+  assert_eq "$(ls -A "$ACTIVE" | grep -c '^\.state\.')" "0"
+}
+test_state_update_breaks_lock_of_dead_owner() {
+  start_task
+  bash -c 'exit 0' & dead=$!; wait "$dead"
+  mkdir "$ACTIVE/state.lock"; echo "$dead" > "$ACTIVE/state.lock/owner"
+  cc_state_update '.milestone=7' || _fail "죽은 소유자의 잠금을 넘지 못함"
+  assert_eq "$(state .milestone)" "7"
+  assert_no_path "$ACTIVE/state.lock"
+}
+test_state_update_keeps_lock_of_live_owner() {
+  start_task
+  perl -e 'sleep 30' "lock-owner-$TMP" & live=$!
+  mkdir "$ACTIVE/state.lock"; echo "$live" > "$ACTIVE/state.lock/owner"
+  before=$(cat "$ACTIVE/state.json")
+  CC_STATE_LOCK_WAIT_SECS=1 cc_state_update '.milestone=7' 2>/dev/null && _fail "살아 있는 소유자의 잠금을 무시함"
+  assert_eq "$(cat "$ACTIVE/state.json")" "$before"
+  assert_eq "$(cat "$ACTIVE/state.lock/owner")" "$live"
+  kill "$live" 2>/dev/null
+}
+test_state_update_releases_lock_after_failure() {
+  start_task
+  cc_state_update 'error("x")' && _fail "실패해야 하는 갱신이 성공"
+  assert_no_path "$ACTIVE/state.lock"
+  CC_STATE_LOCK_WAIT_SECS=1 cc_state_update '.milestone=3' || _fail "실패 뒤 잠금이 남음"
+  assert_eq "$(state .milestone)" "3"
+  assert_no_path "$ACTIVE/state.lock"
+}
+test_state_lock_reclaims_lock_left_by_same_process() {
+  # 신호 때문에 잠금을 잡은 기록(깊이)만 잃은 경우: owner 가 자기 PID 면 자기 잠금으로 다시 쓴다
+  start_task
+  (
+    me=$(exec perl -e 'print getppid()')
+    mkdir "$ACTIVE/state.lock" && echo "$me" > "$ACTIVE/state.lock/owner"
+    CC_STATE_LOCK_WAIT_SECS=1 cc_state_update '.milestone=5'
+  ) || _fail "자기 PID 로 남은 잠금을 다시 잡지 못함"
+  assert_eq "$(state .milestone)" "5"
+  assert_no_path "$ACTIVE/state.lock"
+}

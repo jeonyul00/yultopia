@@ -1,0 +1,94 @@
+#!/bin/bash
+# fake-codex - 테스트 전용 가짜 codex. 실제 codex 는 절대 부르지 않는다.
+#
+# 받는 인자 (cc_codex_argv 와 같은 두 형태)
+#   exec --json -s read-only --output-schema <schema> -o <result> -
+#   exec resume --json -c sandbox_mode="read-only" --output-schema <schema> -o <result> <session_id> -
+#
+# 기록 (n = 이 테스트에서 몇 번째 호출인지, mkdir 로 겹치지 않게 센다)
+#   $FAKE_CODEX_LOG/<n>.argv   인자 한 줄에 하나
+#   $FAKE_CODEX_LOG/<n>.stdin  받은 stdin 그대로
+#   $FAKE_CODEX_LOG/<n>.cwd    실행 위치
+#
+# 환경변수
+#   FAKE_CODEX_SEQ     쉼표로 구분한 호출 순서별 모드 (예: fail_fast,ok). 목록이 끝나면 ok
+#   FAKE_CODEX_RESULT  ok 일 때 -o 파일에 쓸 JSON (기본: 유효한 plan 응답)
+#   FAKE_CODEX_DELAY   slow 모드에서 기다릴 초 (기본 3)
+#
+# 모드
+#   ok            exec 이면 thread.started(thread_id fake-thread-1), turn.completed(usage 100/20/10), 결과 기록, exit 0
+#   invalid_json  이벤트는 ok 와 같고 -o 에 "not json" 기록, exit 0
+#   fail_fast     stderr 에 오류 한 줄, exit 1
+#   hang          명령줄에 테스트 폴더 표시가 있는 자식(sleep 1000)을 만들고 자신도 계속 대기
+#   slow          FAKE_CODEX_DELAY 초 동안 1초마다 이벤트를 쓰다가 ok
+
+log="${FAKE_CODEX_LOG:-${TMP:-/tmp}/fake-codex.log}"
+mkdir -p "$log" || exit 70
+n=1
+while ! mkdir "$log/.n.$n" 2>/dev/null; do
+  n=$((n + 1))
+  [ "$n" -gt 1000 ] && { echo "fake-codex: 호출 번호를 정하지 못했습니다" >&2; exit 71; }
+done
+printf '%s\n' "$@" > "$log/$n.argv"
+cat > "$log/$n.stdin"
+pwd -P > "$log/$n.cwd"
+
+resume=0
+[ "${1:-}" = exec ] && [ "${2:-}" = resume ] && resume=1
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="${2:-}"; [ $# -gt 1 ] && shift ;;
+  esac
+  shift
+done
+
+IFS=, read -r -a seq <<< "${FAKE_CODEX_SEQ:-}"
+mode="${seq[$((n - 1))]:-ok}"
+
+default_result='{"verdict":"plan","summary":"가짜 계획","plan":{"overview":"가짜 전체 계획","milestones":[{"id":1,"title":"첫 단계","done_criteria":"테스트 통과"},{"id":2,"title":"둘째 단계","done_criteria":"검수 통과"}]},"milestone":1,"instruction":"1번 마일스톤을 구현하세요","findings":[],"question":null}'
+
+thread_started() {
+  [ "$resume" = 0 ] && printf '%s\n' '{"type":"thread.started","thread_id":"fake-thread-1"}'
+  printf '%s\n' '{"type":"turn.started"}'
+}
+turn_completed() {
+  printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10}}'
+}
+write_out() {
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$1" > "$out"
+}
+
+case "$mode" in
+  ok)
+    thread_started; turn_completed
+    write_out "${FAKE_CODEX_RESULT:-$default_result}"
+    exit 0 ;;
+  invalid_json)
+    thread_started; turn_completed
+    write_out "not json"
+    exit 0 ;;
+  fail_fast)
+    echo "fake-codex: 가짜 실행 오류" >&2
+    exit 1 ;;
+  hang)
+    thread_started
+    perl -e 'sleep 1000' "fake-codex-hang:$log" &
+    wait
+    exit 0 ;;
+  slow)
+    thread_started
+    i=0
+    while [ "$i" -lt "${FAKE_CODEX_DELAY:-3}" ]; do
+      sleep 1
+      printf '%s\n' '{"type":"item.completed","item":{"type":"reasoning"}}'
+      i=$((i + 1))
+    done
+    turn_completed
+    write_out "${FAKE_CODEX_RESULT:-$default_result}"
+    exit 0 ;;
+  *)
+    echo "fake-codex: 알 수 없는 모드: $mode" >&2
+    exit 2 ;;
+esac

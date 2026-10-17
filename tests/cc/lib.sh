@@ -24,6 +24,11 @@ export CC_CALL_TIMEOUT_SECS="${CC_CALL_TIMEOUT_SECS:-30}"
 export CC_ORPHAN_GRACE_SECS="${CC_ORPHAN_GRACE_SECS:-2}"
 # 가짜 codex (호출하는 쪽이 `CC_CODEX_BIN=... run_cc` 로 덮어쓸 수 있다)
 export CC_CODEX_BIN="${CC_CODEX_BIN:-$CC_TEST_DIR/fake-codex}"
+# 가짜 codex 설정값. 바깥 환경 값은 버리고 export 표시만 해 둔다.
+# 그래서 테스트 안에서 `FAKE_CODEX_SEQ=hang` 처럼 대입만 해도 감독 프로세스와 가짜 codex 에 전달된다.
+# FAKE_CODEX_LOG 는 start_task 가 테스트 폴더 안으로 정한다 (run_cc 도 같은 기본값을 쓴다).
+unset FAKE_CODEX_SEQ FAKE_CODEX_RESULT FAKE_CODEX_DELAY FAKE_CODEX_LOG
+export FAKE_CODEX_SEQ FAKE_CODEX_RESULT FAKE_CODEX_DELAY FAKE_CODEX_LOG
 
 . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/common.sh"
 . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/state.sh"
@@ -70,6 +75,7 @@ cc_path() { bash "$CC_BIN" path "$1" 2>/dev/null; }
 
 start_task() {
   local repo
+  FAKE_CODEX_LOG="${FAKE_CODEX_LOG:-$TMP/fake-codex.log}"
   repo=$(make_repo "${1:-repo}") || return 1
   cd "$repo" || return 1
   printf '목표: 기본 정리본\n' | run_cc init

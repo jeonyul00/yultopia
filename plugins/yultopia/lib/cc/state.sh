@@ -51,8 +51,86 @@ cc_state_get() {
   jq -r "$1" "$a/state.json"
 }
 
-# cc_state_update <jq-filter> [--arg k v ...] : 임시 파일 + mv 로 원자적 쓰기, last_activity_at 갱신
-cc_state_update() {
+# ---- state.json 잠금 (Ruling R11) ----
+# 여러 프로세스(call, 감독 프로세스, wait …)가 state.json 을 읽고-고쳐-쓰므로 갱신은 잠금 안에서 한다.
+#   잠금 = active/state.lock 디렉터리, 안의 owner 파일 = 잠금을 잡은 셸의 PID.
+#   - 잡기: 임시 디렉터리에 owner 를 먼저 써 두고 rename 으로 state.lock 자리에 놓는다.
+#     rename 은 비어 있지 않은 디렉터리를 덮지 못하므로 한 쪽만 성공하고, owner 가 빈 잠금은 생기지 않는다.
+#   - 기다리기: 최대 CC_STATE_LOCK_WAIT_SECS 초(기본 5).
+#   - 소유자가 확실히 죽었을 때(kill 0 → ESRCH)만 잠금을 치운다. 권한 없음·판단 불가면 살아 있다고 본다.
+#   - owner 가 자기 PID 면 자기 잠금이다 (잡은 직후 신호로 깊이 기록만 잃은 경우). 그대로 잡은 것으로 본다.
+#   - 풀기: owner 가 자기일 때만 다른 이름으로 rename 한 뒤 지운다.
+#   - 같은 셸 안에서는 다시 잡아도 된다(깊이만 센다). 이 값은 export 하지 않으므로 자식 프로세스로 넘어가지 않는다.
+#   PID 는 perl 의 getppid() 로 얻는다. bash 3.2 의 $$ 는 서브셸에서도 바깥 셸 PID 라서 쓸 수 없다.
+: "${CC_STATE_LOCK_WAIT_SECS:=5}"
+_CC_STATE_LOCK_DEPTH=0
+
+# 0 잡음 / 1 시간 안에 못 잡음·오류
+cc_state_lock() {
+  local a
+  if [ "${_CC_STATE_LOCK_DEPTH:-0}" -gt 0 ]; then
+    _CC_STATE_LOCK_DEPTH=$((_CC_STATE_LOCK_DEPTH + 1))
+    return 0
+  fi
+  a=$(cc_active_dir) || return 1
+  [ -d "$a" ] || return 1
+  perl -MTime::HiRes -e '
+    my ($lock, $wait) = @ARGV;
+    my $me = getppid();
+    my $deadline = Time::HiRes::time() + $wait;
+    my $owner_of = sub {
+      open(my $f, "<", "$_[0]/owner") or return "";
+      my $p = <$f>; close $f;
+      $p = "" unless defined $p; chomp $p; return $p;
+    };
+    while (1) {
+      my $tmp = "$lock.tmp.$me.$$." . int(rand(1e9));
+      mkdir $tmp or exit 1;
+      my $f;
+      my $ok = open($f, ">", "$tmp/owner") && print($f "$me\n") && close($f);
+      if ($ok && rename($tmp, $lock)) { exit 0 }
+      unlink "$tmp/owner"; rmdir $tmp;
+      exit 1 unless $ok;
+      my $p = $owner_of->($lock);
+      # 자기 PID 의 잠금: 잡은 직후 신호 처리로 깊이 기록만 잃은 경우다 (살아 있는 PID 는 하나뿐). 그대로 쓴다.
+      exit 0 if $p eq $me;
+      if ($p =~ /^[1-9][0-9]*$/ && !kill(0, $p) && $!{ESRCH}) {
+        # 소유자가 확실히 없다. 그 사이 다른 쪽이 새로 잡지 않았는지 한 번 더 보고 치운다.
+        my $gone = "$lock.stale.$me.$$." . int(rand(1e9));
+        if ($owner_of->($lock) eq $p && rename($lock, $gone)) {
+          unlink "$gone/owner"; rmdir $gone;
+          next;
+        }
+      }
+      exit 1 if Time::HiRes::time() >= $deadline;
+      Time::HiRes::sleep(0.05);
+    }
+  ' -- "$a/state.lock" "$CC_STATE_LOCK_WAIT_SECS" || return 1
+  _CC_STATE_LOCK_DEPTH=1
+}
+
+cc_state_unlock() {
+  local a
+  [ "${_CC_STATE_LOCK_DEPTH:-0}" -gt 0 ] || return 0
+  _CC_STATE_LOCK_DEPTH=$((_CC_STATE_LOCK_DEPTH - 1))
+  [ "$_CC_STATE_LOCK_DEPTH" -eq 0 ] || return 0
+  a=$(cc_active_dir) || return 1
+  perl -e '
+    my ($lock) = @ARGV;
+    my $me = getppid();
+    open(my $f, "<", "$lock/owner") or exit 1;
+    my $p = <$f>; close $f;
+    $p = "" unless defined $p; chomp $p;
+    exit 1 unless $p eq $me;
+    my $gone = "$lock.rel.$me.$$." . int(rand(1e9));
+    rename($lock, $gone) or exit 1;
+    unlink "$gone/owner"; rmdir $gone;
+    exit 0;
+  ' -- "$a/state.lock"
+}
+
+# 잠금 없이 한 번 갱신 (cc_state_update 와 잠금을 이미 잡은 호출자만 쓴다)
+_cc_state_update_nolock() {
   local filter="$1" a tmp now
   shift
   a=$(cc_active_dir) || return 1
@@ -65,6 +143,20 @@ cc_state_update() {
     rm -f "$tmp"
     return 1
   fi
+}
+
+# cc_state_update <jq-filter> [--arg k v ...] : 잠금 안에서 임시 파일 + mv 로 원자적 쓰기, last_activity_at 갱신
+#   잠금을 못 잡으면 쓰지 않고 1. 갱신이 실패해도 잠금은 항상 푼다.
+cc_state_update() {
+  local rc
+  if ! cc_state_lock; then
+    cc_err "[cc] state.json 잠금을 얻지 못했습니다"
+    return 1
+  fi
+  _cc_state_update_nolock "$@"
+  rc=$?
+  cc_state_unlock
+  return "$rc"
 }
 
 # 안전 검사를 통과할 때만 active 를 정확한 경로로 삭제

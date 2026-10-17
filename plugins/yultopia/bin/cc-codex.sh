@@ -3,8 +3,10 @@
 SELF="${BASH_SOURCE[0]}"
 SELF_DIR=$(cd "$(dirname "$SELF")" && pwd -P)
 LIB_DIR="$SELF_DIR/../lib/cc"
+# 감독 프로세스를 띄울 때 쓰는 이 스크립트의 절대 경로
+CC_SELF_ABS="$SELF_DIR/$(basename "$SELF")"
 
-for _cc_lib in common state snapshot proc render; do
+for _cc_lib in common state snapshot proc render call; do
   . "$LIB_DIR/$_cc_lib.sh" || { echo "[cc] 내부 오류: $LIB_DIR/$_cc_lib.sh 를 불러오지 못했습니다"; exit 1; }
 done
 
@@ -95,6 +97,8 @@ case "$cmd" in
   path)   cc_cmd_path "$@" ;;
   status) cc_cmd_status "$@" ;;
   finish) cc_cmd_finish "$@" ;;
+  call)   cc_cmd_call "$@" ;;
+  _supervise) cc_cmd_supervise "$@" ;;
   *) cc_line "[cc] 알 수 없는 하위 명령: ${cmd:-(없음)}"; exit 1 ;;
 esac
 exit $?
