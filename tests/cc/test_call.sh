@@ -187,6 +187,34 @@ test_activity_updates_while_events_grow() {
   assert_eq "$(cat "$CALL1/status")" "ok"
 }
 
+# ---- 실행 중 단계 (Task 7): review → reviewing, plan → planning, message 는 그대로 ----
+test_review_call_sets_phase_reviewing() {
+  FAKE_CODEX_SEQ=ok,hang; start_task
+  run_cc call plan; wait_until_status_file 1
+  assert_eq "$(state .phase)" "working"
+  printf '%s' "$REVIEW_REPORT" > "$(cc_path report)"
+  run_cc call review; assert_code 0
+  assert_eq "$(state .phase)" "reviewing"
+  run_cc status; assert_contains "$OUT" "단계: reviewing"
+  call_reap
+}
+test_plan_call_sets_phase_planning() {
+  FAKE_CODEX_SEQ=hang; start_task
+  set_state '.phase = "failed"'
+  run_cc call plan; assert_code 0
+  assert_eq "$(state .phase)" "planning"
+  call_reap
+}
+test_message_call_keeps_phase() {
+  FAKE_CODEX_SEQ=ok,hang; start_task
+  run_cc call plan; wait_until_status_file 1
+  set_state '.phase = "asking"'
+  printf '사용자 답변\n' > "$(cc_path message)"
+  run_cc call message; assert_code 0
+  assert_eq "$(state .phase)" "asking"
+  call_reap
+}
+
 # ---- 실패로 끝나는 호출 (Task 6 의 재시도가 붙어도 결과가 같도록 두 번 연속 실패시킨다) ----
 test_invalid_result_ends_call_as_invalid_json() {
   FAKE_CODEX_SEQ=invalid_json,invalid_json; start_task

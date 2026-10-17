@@ -391,6 +391,75 @@ test_kill_rejects_invalid_pgid_without_signalling() {
   assert_eq "$(wc -l < "$TMP/rcs" | tr -d ' ')" "16"
 }
 
+# ---- cc_kill_group_verified 의 리더 대기 시간 (Task 7 addendum A) ----
+proc_ms() { perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time() * 1000'; }
+test_kill_with_leader_grace_lets_leader_finish_cleanup() {
+  # 리더는 TERM 을 받으면 4초 동안 정리한 뒤 표시 파일을 쓰고 끝난다. 기본(약 3초 뒤 KILL)이면 정리 도중 죽는다
+  pg=$(cc_spawn_group "$TMP/log" bash -c 'trap "sleep 4; echo done > \"\$1\"; exit 0" TERM; echo > "$2"; sleep 30 & wait' \
+        "cc-test-$TMP" "$TMP/marker" "$TMP/ready")
+  proc_until 5 test -e "$TMP/ready" || _fail "리더가 준비되지 않음"
+  id=$(cc_proc_identity "$pg")
+  cc_kill_group_verified "$pg" "$id" 80; rc=$?
+  assert_eq "$rc" "0"
+  assert_eq "$(cat "$TMP/marker" 2>/dev/null)" "done" "리더가 정리를 끝내기 전에 KILL 됨"
+  assert_code_of 1 kill -0 -- "-$pg"
+  proc_reap "$pg"
+}
+test_kill_with_leader_grace_kills_leftovers_once_leader_exits() {
+  # 리더는 TERM 에 바로 끝나지만 멤버는 TERM 을 무시한다 → 리더가 끝나면 남은 대기 시간을 다 쓰지 않고 바로 KILL
+  cat > "$TMP/leader.sh" <<'EOF'
+#!/bin/bash
+perl -e '$SIG{TERM} = "IGNORE"; open(my $f, ">", $ARGV[0]); close $f; sleep 30' "$1" &
+sleep 30
+EOF
+  pg=$(cc_spawn_group "$TMP/log" bash "$TMP/leader.sh" "$TMP/ready")
+  proc_until 5 test -e "$TMP/ready" || _fail "멤버가 준비되지 않음"
+  id=$(cc_proc_identity "$pg")
+  t0=$(proc_ms)
+  cc_kill_group_verified "$pg" "$id" 100; rc=$?
+  el=$(( $(proc_ms) - t0 ))
+  assert_eq "$rc" "0"
+  [ "$el" -lt 2500 ] || _fail "리더가 끝났는데 ${el}ms 동안 KILL 을 미룸"
+  assert_code_of 1 kill -0 -- "-$pg"
+  proc_reap "$pg"
+}
+test_kill_with_leader_grace_kills_after_grace_expires() {
+  # 리더가 TERM 을 무시하고 끝나지 않으면 정한 시간(1초)이 지난 뒤 KILL
+  pg=$(cc_spawn_group "$TMP/log" bash -c 'trap "" TERM; echo > "$1"; while :; do sleep 0.2; done' "cc-test-$TMP" "$TMP/ready")
+  proc_until 5 test -e "$TMP/ready" || _fail "리더가 준비되지 않음"
+  id=$(cc_proc_identity "$pg")
+  t0=$(proc_ms)
+  cc_kill_group_verified "$pg" "$id" 10; rc=$?
+  el=$(( $(proc_ms) - t0 ))
+  assert_eq "$rc" "0"
+  [ "$el" -ge 900 ] || _fail "정한 시간 전에 KILL (${el}ms)"
+  [ "$el" -lt 2500 ] || _fail "정한 시간(1초)이 지났는데 ${el}ms 동안 KILL 을 미룸"
+  assert_code_of 1 kill -0 -- "-$pg"
+  proc_reap "$pg"
+}
+
+# ---- cc_kill_own_group_members 의 TERM 대기 시간 (감독 프로세스의 중단 경로, Task 7 addendum A) ----
+test_own_group_members_term_grace_can_be_shortened() {
+  cat > "$TMP/own.sh" <<'EOF'
+#!/bin/bash
+. "$1/plugins/yultopia/lib/cc/common.sh"; . "$1/plugins/yultopia/lib/cc/proc.sh"
+perl -e '$SIG{TERM} = "IGNORE"; sleep 30' "own-member-$2" &
+sleep 0.5
+t0=$(perl -MTime::HiRes -e 'printf "%d", Time::HiRes::time() * 1000')
+cc_kill_own_group_members $$ 1; rc=$?
+t1=$(perl -MTime::HiRes -e 'printf "%d", Time::HiRes::time() * 1000')
+echo "$rc $((t1 - t0))" > "$2.tmp" && mv "$2.tmp" "$2"
+EOF
+  pg=$(cc_spawn_group "$TMP/log" bash "$TMP/own.sh" "$CC_REPO_ROOT" "$TMP/own.out")
+  proc_until 10 test -s "$TMP/own.out" || _fail "결과가 없음"
+  read -r rc el < "$TMP/own.out"
+  assert_eq "$rc" "0"
+  [ "$el" -ge 900 ] || _fail "TERM 뒤 기다리지 않고 바로 KILL (${el}ms)"
+  [ "$el" -lt 2500 ] || _fail "TERM 대기를 1초로 줄였는데 ${el}ms 걸림"
+  assert_no_process_matching "own-member-$TMP/own.out"
+  proc_reap "$pg"
+}
+
 # ---- cc-codex.sh 가 proc.sh 를 불러오는지 ----
 test_cli_fails_loudly_without_proc_lib() {
   mkdir -p "$TMP/plugin/bin" "$TMP/plugin/lib/cc"

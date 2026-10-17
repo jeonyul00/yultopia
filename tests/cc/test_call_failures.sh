@@ -208,7 +208,9 @@ test_timeout_enforced_without_waiter() {
   FAKE_CODEX_SEQ=hang; CC_CALL_TIMEOUT_SECS=2; start_task
   run_cc call plan; assert_code 0
   assert_eq "$(state .waiter)" "null"
-  sleep 7                                       # 아무도 기다리거나 확인하지 않는다
+  # wait 명령은 부르지 않는다. 테스트는 status 파일만 지켜본다 (대기자 없음)
+  wait_until_status_file 1 10 || _fail "대기자 없이 시간 상한이 지켜지지 않음"
+  assert_eq "$(state .waiter)" "null"
   assert_eq "$(cat "$CALL1/status" 2>/dev/null)" "timeout"
   assert_eq "$(state .running)" "null"
   assert_eq "$(state .last_call.status)" "timeout"
@@ -226,7 +228,8 @@ test_timeout_inside_fast_fail_window_is_not_retried() {
 }
 test_format_retry_gets_its_own_full_deadline() {
   # Ruling R16: 시간 상한은 codex 실행 한 번마다. 1회차가 상한 대부분을 써도 형식 재요청은 새 상한을 받는다
-  FAKE_CODEX_SEQ=slow_invalid_json,slow; FAKE_CODEX_DELAY=3; CC_CALL_TIMEOUT_SECS=4; start_task
+  #   (각 시도 약 3초 < 5초, 합계 약 6초 > 5초)
+  FAKE_CODEX_SEQ=slow_invalid_json,slow; FAKE_CODEX_DELAY=3; CC_CALL_TIMEOUT_SECS=5; start_task
   run_cc call plan; assert_code 0
   wait_until_status_file 1 20 || _fail "status 파일이 생기지 않음"
   assert_eq "$(cat "$CALL1/status")" "ok"
@@ -287,6 +290,7 @@ test_ack_rejects_without_active_task() {
   repo=$(make_repo); cd "$repo"
   run_cc ack-rejects; assert_code 1
   assert_eq "$(cf_lines "$OUT")" "1"; assert_contains "$OUT" "[cc] "
+  assert_contains "$OUT" "진행 중인 작업이 없습니다"
 }
 
 # ---- addendum D: 호출이 끝나면 감독 프로세스 그룹에 아무것도 남지 않는다 ----
@@ -416,4 +420,41 @@ test_concurrent_calls_start_exactly_one() {
   assert_eq "$(pgrep -f -- "fake-codex-hang:$FAKE_CODEX_LOG" | wc -l | tr -d ' ')" "1"
   assert_eq "$(state .calls_total)" "1"
   cf_reap
+}
+
+# ---- Task 7 addendum C: 그룹 정리를 할 수 없을 때도 TERM 을 무시하는 codex 를 KILL 까지 한다 ----
+test_timeout_fallback_kills_term_ignoring_codex() {
+  FAKE_CODEX_SEQ=hang_stubborn; start_task
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/render.sh"
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
+  # 테스트 전용 대역: 그룹 정리가 거부된 상황(ps 실패 등)을 만든다. 이 테스트 셸 안에서만 바뀐다
+  cc_kill_own_group_members() { return 2; }
+  set_state '.calls_total = 1 | .running = {call_id: 1, kind: "plan", pgid: 1, supervisor_identity: "x|y",
+    codex_pid: null, codex_identity: null, started_at: "2026-01-01T00:00:00Z", review_tree: null}'
+  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_CLAIMED=1; _CC_SUP_TIMED_OUT=0
+  mkdir -p "$_CC_SUP_DIR"; printf '프롬프트\n' > "$_CC_SUP_DIR/prompt.md"
+  CC_CALL_TIMEOUT_SECS=1; _cc_sup_init_config
+  _cc_sup_run_codex exec - "$_CC_SUP_DIR/prompt.md" >> "$TMP/sup.log" 2>&1
+  assert_eq "$_CC_SUP_TIMED_OUT" "1"
+  cp=$(state '.running.codex_pid // empty')
+  [ -n "$cp" ] || _fail "codex_pid 가 기록되지 않음"
+  cf_until 3 cf_pid_gone "$cp" || _fail "그룹 정리가 거부되자 TERM 을 무시하는 codex 가 계속 살아 있음 (pid $cp)"
+  grep -q '그룹 정리를 하지 못함' "$TMP/sup.log" || _fail "대역이 쓰이지 않음 (테스트 전제 깨짐)"
+  pkill -KILL -f -- "fake-codex-stubborn:$FAKE_CODEX_LOG" 2>/dev/null
+  [ -n "$cp" ] && kill -KILL "$cp" 2>/dev/null
+  return 0
+}
+
+# ---- Task 7 addendum D: codex 인자를 못 만들면(아무것도 실행하지 않음) 빠른 실패로 재실행하지 않는다 ----
+test_argv_build_failure_is_not_retried() {
+  start_task
+  set_state '.session_id = "bad session id"'      # resume 인자로 쓸 수 없는 세션 ID
+  printf '사용자 지시\n' > "$(cc_path message)"
+  run_cc call message; assert_code 0
+  wait_until_status_file 1 || _fail "status 파일이 생기지 않음"
+  cf_assert_failed_state error
+  assert_contains "$(state .last_call.message)" "인자"
+  assert_not_contains "$(state .last_call.message)" "재시도"
+  assert_eq "$(cf_invocations)" "0"
+  assert_eq "$(state .calls_total)" "1"
 }

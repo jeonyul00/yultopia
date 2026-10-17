@@ -6,6 +6,7 @@
 #     1) 거부 조건·입력 파일 확인 → review 면 작업 트리 스냅샷
 #     2) state 잠금 안에서: 거부 조건 재확인 → calls/<n>/prompt.md 생성
 #        → 감독 프로세스를 새 프로세스 그룹으로 실행 → calls_total=n, running={…, pgid, supervisor_identity} 기록
+#           (실행 중 단계: plan → phase=planning, review → phase=reviewing, message 는 그대로)
 #        → 한 줄 출력하고 곧바로 끝난다
 #   _supervise <n>  (감독 프로세스. 출력은 supervisor.log 로만)
 #     1) running 이 자기(call_id=n, pgid=$$)를 가리킬 때까지 기다린다. 끝내 아니면 codex 를 띄우지 않고 끝낸다
@@ -19,6 +20,7 @@
 #        - CC_FAST_FAIL_SECS 안에 비정상 종료하고 result 가 없으면 같은 인자로 1회 재실행
 #        - result 가 형식에 맞지 않고 세션 ID 를 알면 pm-format-retry.md 로 resume 1회
 #        - 시간 상한으로 끊긴 호출은 빠른 실패 구간 안이어도 timeout 이고 재시도하지 않는다 (Ruling R6)
+#        - codex 인자를 만들지 못해 아무것도 실행하지 않았으면 다시 해도 같으므로 재실행 없이 error
 #        시도마다 기록 파일을 따로 둔다: 1회차 events.jsonl / stderr.log, k회차 events-k.jsonl / stderr-k.log,
 #        형식 재요청 프롬프트는 prompt-format-retry.md. result.json 은 시도마다 지우고 같은 경로에 받는다.
 #     6) 세션 ID·토큰 추출(모든 시도), result.json 검증, verdict 반영, running=null, last_call 기록 → 마지막에 status 파일
@@ -112,10 +114,11 @@ _cc_call_read_state() {
 }
 
 # _cc_call_is_running <state-json> : 0 = 실행 중으로 본다(살아 있음 또는 판단 불가) / 1 = 실행 중 아님
-#   running 이 null 이면 아님. 기록된 감독 프로세스와 codex 가 둘 다 확실히 끝났으면(없음·PID 재사용)
-#   낡은 기록이므로 막지 않는다 (낡은 기록 정리는 Task 8 몫). 하나라도 살아 있거나 판단할 수 없으면 실행 중.
-#   codex 를 기록하기 전에 감독 프로세스가 사라졌으면 codex 가 그 그룹에 살아 있을 수 있다. 그때는 그룹에
-#   신호 0 을 보내 확인만 하고(아무것도 보내지 않음), 그룹이 비어 있지 않거나 판단할 수 없으면 실행 중으로 본다.
+#   running 이 null 이면 아님. 하나라도 살아 있거나 판단할 수 없으면 실행 중.
+#   기록된 감독 프로세스와 codex(기록돼 있으면)가 둘 다 확실히 끝났어도(없음·PID 재사용) 그 그룹에 무언가
+#   (codex 의 자식, 기록 전에 실행된 codex 등)가 남아 있을 수 있다. 그룹에 신호 0 을 보내 확인만 하고
+#   (아무것도 보내지 않음), 그룹이 확실히 비었을 때만 낡은 기록으로 본다 (낡은 기록 정리는 Task 8 몫).
+#   그룹이 비어 있지 않거나 판단할 수 없으면 실행 중: 남은 것이 사는 동안 두 번째 Codex 를 띄우지 않는다.
 #   거부는 안전하다. 이 확인되지 않은 근거로 무언가를 죽이지는 않는다.
 _cc_call_is_running() {
   local st="$1" pg sid cp cid r1 r2=1
@@ -127,10 +130,10 @@ _cc_call_is_running() {
   cc_proc_alive_verified "$pg" "$sid"; r1=$?
   if [ -n "$cp" ]; then
     cc_proc_alive_verified "$cp" "$cid"; r2=$?
-  elif [ "$r1" -eq 1 ]; then
-    _cc_proc_probe "-$pg"; [ $? -eq 1 ] || r2=0
   fi
-  [ "$r1" -eq 1 ] && [ "$r2" -eq 1 ] && return 1
+  [ "$r1" -eq 1 ] && [ "$r2" -eq 1 ] || return 0
+  # r1 이 1 이면 pg 는 형식이 맞는 PID 다 (형식 오류는 2)
+  _cc_proc_probe "-$pg"; [ $? -eq 1 ] && return 1
   return 0
 }
 
@@ -210,7 +213,8 @@ _cc_call_start_locked() {
   if ! cc_state_update '.calls_total = $n
       | .running = {call_id: $n, kind: $kind, pgid: $pg, supervisor_identity: $ident,
                     codex_pid: null, codex_identity: null, started_at: $now,
-                    review_tree: (if $rt == "" then null else $rt end)}' \
+                    review_tree: (if $rt == "" then null else $rt end)}
+      | .phase = (if $kind == "review" then "reviewing" elif $kind == "plan" then "planning" else .phase end)' \
       --argjson n "$n" --arg kind "$kind" --argjson pg "$pgid" --arg ident "$ident" --arg now "$now" --arg rt "$rt"; then
     cc_kill_group_verified "$pgid" "$ident" >/dev/null 2>&1
     cc_line "[cc] 상태 파일을 쓰지 못해 Codex를 호출하지 않았습니다."
@@ -254,6 +258,7 @@ cc_cmd_call() {
 #       _CC_SUP_CODEX_PID / _CC_SUP_CODEX_IDENT (실행 중인 codex 자식), _CC_SUP_CODEX_RECORDED(state 에 기록함),
 #       _CC_SUP_ATTEMPT(지금 몇 번째 시도), _CC_SUP_ATTEMPT_SECS(직전 시도가 걸린 초),
 #       _CC_SUP_T0(이번 시도의 codex 시작 시각, $SECONDS), _CC_SUP_TIMED_OUT(시간 상한으로 끊음),
+#       _CC_SUP_NO_START(이번 시도에서 codex 인자를 못 만들어 아무것도 실행하지 않음),
 #       _CC_SUP_TIMEOUT / _CC_SUP_FAST_FAIL / _CC_SUP_POLL / _CC_SUP_MAX_CALLS (검사한 설정값)
 
 _cc_sup_log() { printf '%s [call %s] %s\n' "$(cc_now_iso)" "${_CC_SUP_ID:-?}" "$*"; }
@@ -340,28 +345,45 @@ _cc_sup_deadline_passed() {
   [ -n "${_CC_SUP_T0:-}" ] && [ $((SECONDS - _CC_SUP_T0)) -gt "$_CC_SUP_TIMEOUT" ]
 }
 
+# _cc_sup_timeout_message [상한 초] : 기본은 이 감독 프로세스의 상한 (wait 는 설정값을 넘겨 같은 문구를 만든다)
 _cc_sup_timeout_message() {
-  local t="$_CC_SUP_TIMEOUT" label
+  local t="${1:-$_CC_SUP_TIMEOUT}" label
   if [ "$t" -gt 0 ] && [ $((t % 60)) -eq 0 ]; then label="$((t / 60))분"; else label="${t}초"; fi
   printf '[cc] Codex 시간 초과(%s) — 자동 재시도하지 않았습니다' "$label"
 }
 
-# _cc_sup_stop_group [codex_pid] : codex 와, 같은 그룹에 남은 모든 프로세스를 끝낸다. 감독 프로세스 자신은 제외.
+# _cc_sup_stop_group [codex_pid] [TERM 뒤 기다릴 초, 기본 3] : codex 와, 같은 그룹에 남은 모든 프로세스를 끝낸다.
+#   감독 프로세스 자신은 제외.
 #   running 을 받은 감독 프로세스(= cc_spawn_group 으로 띄운 그룹 리더)는 멤버를 하나씩 TERM → KILL 한다
-#   (addendum D·E: 자기 그룹 전체 신호는 자신에게도 가므로 쓰지 않는다). 그럴 수 없으면 신원이 확인된 codex 에만 TERM.
+#   (addendum D·E: 자기 그룹 전체 신호는 자신에게도 가므로 쓰지 않는다).
+#   그럴 수 없으면(거부: ps 실패, 정리하던 perl 이 신호로 죽음 등) 신원이 확인된 codex 하나에만 TERM 을 보내고,
+#   정한 시간 안에 끝나지 않으면 신원을 다시 확인한 뒤 KILL 한다 (Task 7 addendum C: TERM 을 무시하는 codex 가
+#   timeout 기록 뒤에도 계속 돌지 않도록). 이때 codex 의 자식은 따로 찾을 수 없다.
+#   0 = 그룹에 남은 것 없음 / 2 = 그룹 정리를 하지 못함 (codex 는 끝냈거나 확인할 수 없음) / 3 = KILL 뒤에도 남음
 _cc_sup_stop_group() {
-  local pid="${1:-}" rc
+  local pid="${1:-}" term="${2:-3}" rc i
+  case "$term" in ''|*[!0-9]*) term=3 ;; esac
   if [ "${_CC_SUP_CLAIMED:-0}" = 1 ]; then
-    cc_kill_own_group_members "$$"; rc=$?
+    cc_kill_own_group_members "$$" "$term"; rc=$?
     case "$rc" in
       0) return 0 ;;
       3) _cc_sup_log "KILL 뒤에도 그룹에 프로세스가 남아 있음"; return 3 ;;
     esac
     _cc_sup_log "그룹 정리를 하지 못함 (코드 $rc)"
   fi
-  if [ -n "$pid" ] && [ -n "$_CC_SUP_CODEX_IDENT" ] && cc_proc_alive_verified "$pid" "$_CC_SUP_CODEX_IDENT"; then
-    kill -TERM "$pid" 2>/dev/null
-  fi
+  [ -n "$pid" ] && [ -n "$_CC_SUP_CODEX_IDENT" ] || return 2
+  cc_proc_alive_verified "$pid" "$_CC_SUP_CODEX_IDENT" || return 2
+  kill -TERM "$pid" 2>/dev/null
+  # codex 는 이 셸의 자식이라 끝나면 bash 가 바로 거둔다: kill -0 이 실패하면 끝난 것
+  i=0
+  while [ "$i" -lt $((term * 10)) ] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  kill -0 "$pid" 2>/dev/null || return 2
+  cc_proc_alive_verified "$pid" "$_CC_SUP_CODEX_IDENT" || return 2
+  _cc_sup_log "codex 가 TERM 뒤에도 끝나지 않아 KILL"
+  kill -KILL "$pid" 2>/dev/null
+  i=0
+  while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  kill -0 "$pid" 2>/dev/null && { _cc_sup_log "KILL 뒤에도 codex 가 남아 있음"; return 3; }
   return 2
 }
 
@@ -403,10 +425,13 @@ _cc_sup_run_codex() {
   local -a argv
   [ -n "${_CC_SUP_TIMEOUT:-}" ] || _cc_sup_init_config
   : "${_CC_SUP_ATTEMPT:=1}"
+  _CC_SUP_NO_START=0
   argv=()
   while IFS= read -r -d '' x; do argv[${#argv[@]}]="$x"; done < <(cc_codex_argv "$mode" "$session" "$_CC_SUP_DIR")
   if [ "${#argv[@]}" -eq 0 ]; then
+    # 아무것도 실행하지 않았다: 이 시도의 실행 시간은 0 이고, 호출한 쪽은 재실행하지 않는다 (addendum D)
     _cc_sup_log "codex 인자를 만들지 못함 (mode=$mode)"
+    _CC_SUP_NO_START=1; _CC_SUP_ATTEMPT_SECS=0
     return 125
   fi
   events=$(_cc_sup_events_file "$_CC_SUP_ATTEMPT")
@@ -615,7 +640,13 @@ _cc_sup_on_exit() {
     msg="[cc] Codex 감독 프로세스가 예기치 않게 끝났습니다 (코드 $rc)."
   fi
   _cc_sup_log "비정상 종료 → $st"
-  _cc_sup_stop_group "$_CC_SUP_CODEX_PID"
+  # 중단 신호면 멤버도 대개 같은 TERM 을 이미 받았다 (wait 는 그룹 전체에 보낸다). TERM 뒤 1초만 기다리고 KILL 해서
+  # 기다리는 쪽(wait)이 KILL 하기 전에 마무리(state·status 기록)를 끝낸다 (Task 7 addendum A)
+  if [ -n "$_CC_SUP_SIGNAL" ]; then
+    _cc_sup_stop_group "$_CC_SUP_CODEX_PID" 1
+  else
+    _cc_sup_stop_group "$_CC_SUP_CODEX_PID"
+  fi
   _cc_sup_finish "$st" "$msg"
 }
 
@@ -639,6 +670,11 @@ _cc_sup_main() {
   while :; do
     _cc_sup_run_codex "$mode" "$session" "$prompt"
     rc=$?
+    # 인자를 만들지 못해 codex 를 실행하지 않았다: 다시 해도 같으므로 호출 번호를 쓰지 않고 끝낸다 (addendum D)
+    if [ "${_CC_SUP_NO_START:-0}" = 1 ]; then
+      _cc_sup_finish error "[cc] Codex 실행 인자를 만들지 못해 Codex를 실행하지 않았습니다 (세션 ID 형식 확인 필요)."
+      return 0
+    fi
     # 시간 상한: 빠른 실패 구간 안이어도 timeout, 재시도 없음 (Ruling R6)
     if [ "$_CC_SUP_TIMED_OUT" = 1 ]; then
       _cc_sup_finish timeout "$(_cc_sup_timeout_message)"; return 0
@@ -698,6 +734,7 @@ cc_cmd_supervise() {
   _CC_SUP_ID="${1:-}"
   _CC_SUP_DONE=0; _CC_SUP_CLAIMED=0; _CC_SUP_SIGNAL=""; _CC_SUP_CODEX_PID=""; _CC_SUP_CODEX_IDENT=""; _CC_SUP_FINAL=""
   _CC_SUP_CODEX_RECORDED=0; _CC_SUP_ATTEMPT=1; _CC_SUP_ATTEMPT_SECS=0; _CC_SUP_T0=""; _CC_SUP_TIMED_OUT=0; _CC_SUP_REC=""
+  _CC_SUP_NO_START=0
   _cc_sup_init_config
   case "$_CC_SUP_ID" in ''|0*|*[!0-9]*) _cc_sup_log "잘못된 호출 번호: ${1:-}"; return 1 ;; esac
   _CC_SUP_ACTIVE=$(cc_active_dir) || { _cc_sup_log "git 저장소를 찾지 못함"; return 1; }
