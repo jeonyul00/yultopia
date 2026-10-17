@@ -4,7 +4,7 @@ SELF="${BASH_SOURCE[0]}"
 SELF_DIR=$(cd "$(dirname "$SELF")" && pwd -P)
 LIB_DIR="$SELF_DIR/../lib/cc"
 
-for _cc_lib in common state; do
+for _cc_lib in common state snapshot; do
   . "$LIB_DIR/$_cc_lib.sh" || { echo "[cc] 내부 오류: $LIB_DIR/$_cc_lib.sh 를 불러오지 못했습니다"; exit 1; }
 done
 
@@ -17,7 +17,7 @@ cc_init_fail() {
 }
 
 cc_cmd_init() {
-  local root active top now tmp
+  local root active top now tmp base_tree
   cc_git_dir >/dev/null || { cc_line "[cc] git 저장소가 아닙니다."; return 1; }
   root=$(cc_root_dir)
   active=$(cc_active_dir)
@@ -40,11 +40,12 @@ cc_cmd_init() {
   cat > "$active/brief.md" || { cc_init_fail "brief.md 를 쓰지 못했습니다"; return 1; }
   top=$(git rev-parse --show-toplevel 2>/dev/null) || top=$(pwd -P)
   now=$(cc_now_iso)
+  base_tree=$(cc_snapshot_tree) && [ -n "$base_tree" ] || { cc_init_fail "작업 트리 스냅샷 실패"; return 1; }
   tmp=$(mktemp "$active/.state.XXXXXX") || { cc_init_fail "임시 파일 생성 실패"; return 1; }
-  jq -n --arg now "$now" --arg root "$top" '{
+  jq -n --arg now "$now" --arg root "$top" --arg base "$base_tree" '{
     version: 1, created_at: $now, last_activity_at: $now, repo_root: $root,
     phase: "planning", session_id: null, milestone: null, milestones_total: null,
-    task_base_tree: null, milestone_base_tree: null, calls_total: 0, rejects_in_row: 0,
+    task_base_tree: $base, milestone_base_tree: null, calls_total: 0, rejects_in_row: 0,
     tokens: {input: 0, cached_input: 0, output: 0},
     running: null, waiter: null, waiter_last_seen_at: null, last_call: null
   }' > "$tmp" && mv "$tmp" "$active/state.json" || { cc_init_fail "state.json 을 쓰지 못했습니다"; return 1; }
