@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "plan", "milestone", "instruction", "findings", "question"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["plan", "approve", "reject", "done", "ask_user"] },
+    "summary": { "type": "string" },
+    "plan": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["overview", "milestones"],
+      "properties": {
+        "overview": { "type": "string" },
+        "milestones": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "title", "done_criteria"],
+            "properties": {
+              "id": { "type": "integer" },
+              "title": { "type": "string" },
+              "done_criteria": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "milestone": { "type": ["integer", "null"] },
+    "instruction": { "type": ["string", "null"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line", "issue", "evidence"],
+        "properties": {
+          "file": { "type": "string" },
+          "line": { "type": ["integer", "null"] },
+          "issue": { "type": "string" },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "question": { "type": ["string", "null"] }
+  }
+}
