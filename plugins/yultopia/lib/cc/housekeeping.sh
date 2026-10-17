@@ -46,11 +46,13 @@ _cc_hk_read_state() {
 
 # _cc_hk_classify : state 를 읽어 분류만 한다 (아무것도 쓰지 않음). 읽지 못하면 _CC_HK_RS=unreadable, 1
 _cc_hk_classify() {
-  _CC_HK_RS=unreadable; _CC_HK_LEFTOVER=0; _CC_HK_PG=""; _CC_HK_ID=""
+  _CC_HK_RS=unreadable; _CC_HK_LEFTOVER=0; _CC_HK_PG=""; _CC_HK_ID=""; _CC_HK_MALFORMED=0
   _CC_HK_ST=$(_cc_hk_read_state) || { _CC_HK_ST=""; return 1; }
   _cc_call_liveness "$_CC_HK_ST"
   _CC_HK_RS=$_CC_LIVENESS; _CC_HK_LEFTOVER=$_CC_LIVENESS_LEFTOVER; _CC_HK_PG=$_CC_LIVENESS_PGID
   _CC_HK_ID=$(_cc_jq_get "$_CC_HK_ST" 'if (.running | type) == "object" then (.running.call_id // empty | tostring) else empty end')
+  # running 기록이 온전하지 않으면 (_cc_running_wellformed) 읽을 수 없는 기록 (discard·finish 만 이 근거로 지운다)
+  _cc_running_wellformed "$_CC_HK_ST" || _CC_HK_MALFORMED=1
   return 0
 }
 
@@ -60,8 +62,10 @@ _cc_hk_running_state() {
   _cc_hk_classify || return 1
   if [ "$_CC_HK_RS" = dead ] && _cc_hk_valid_id "$_CC_HK_ID"; then
     _CC_WAIT_ACTIVE=$(cc_active_dir)
+    _CC_WAIT_SETTLE_WRITER=_cc_wait_update_keep_activity   # 정리는 활동이 아니다: last_activity_at 유지
     _cc_wait_settle "$_CC_HK_ID" interrupted \
       "[cc] Codex 감독 프로세스가 결과를 남기지 않고 끝나 호출 $_CC_HK_ID 을(를) 중단됨으로 기록했습니다." >/dev/null
+    _CC_WAIT_SETTLE_WRITER=_cc_state_update_nolock
     _CC_HK_ST=$(_cc_hk_read_state) || _CC_HK_ST=""
   fi
   return 0
@@ -227,6 +231,11 @@ _cc_hk_delete_if_idle() {
     fi
   fi
   if _cc_hk_classify || [ -z "$limit" ]; then
+    # 사용자가 직접 고른 삭제(limit 없음)는 running 이 형식이 틀린 기록도 지운다: 지킬 실행 기록을 읽을 수 없어
+    # 거부해도 영영 풀리지 않는다. 자동 정리(limit 있음)는 이 경우 지우지 않는다.
+    if [ "$_CC_HK_RS" = uncertain ] && [ -z "$limit" ] && [ "$_CC_HK_MALFORMED" = 1 ]; then
+      _CC_HK_RS=unreadable
+    fi
     case "$_CC_HK_RS" in
       none|dead|unreadable)
         if cc_delete_active; then
@@ -383,10 +392,16 @@ cc_cmd_preflight() {
     _cc_hk_preflight_emit no_codex "[cc] Codex CLI가 설치돼 있지 않습니다. Codex CLI를 설치하고 로그인한 뒤 다시 실행하세요." "" null
     return $?
   fi
-  if ! "$CC_CODEX_BIN" login status </dev/null >/dev/null 2>&1; then
-    _cc_hk_preflight_emit not_logged_in "[cc] Codex CLI에 로그인돼 있지 않습니다. 터미널에서 codex login 을 실행한 뒤 다시 시작하세요." "" null
-    return $?
-  fi
+  cc_run_with_timeout "$CC_LOGIN_TIMEOUT_SECS" "$CC_CODEX_BIN" login status >/dev/null 2>&1
+  case $? in
+    0) ;;
+    124)
+      _cc_hk_preflight_emit not_logged_in "[cc] Codex CLI 로그인 확인이 ${CC_LOGIN_TIMEOUT_SECS}초 안에 끝나지 않았습니다 (시간 초과). 터미널에서 codex login status 를 확인한 뒤 다시 시작하세요." "" null
+      return $?  ;;
+    *)
+      _cc_hk_preflight_emit not_logged_in "[cc] Codex CLI에 로그인돼 있지 않습니다. 터미널에서 codex login 을 실행한 뒤 다시 시작하세요." "" null
+      return $? ;;
+  esac
   _cc_hk_cleanup_stale
   stale=$_CC_HK_LINE
   if cc_active_exists; then
@@ -401,6 +416,8 @@ cc_cmd_preflight() {
     active=$(_cc_hk_active_json)
     if [ "$active" = null ]; then
       msg="[cc] 이전 /cc 작업 기록이 있지만 상태 파일을 읽을 수 없습니다."
+    elif ! _cc_running_wellformed "$(_cc_hk_read_state)"; then
+      msg="[cc] 이전 /cc 작업 기록이 깨져 있어 이어 할 수 없습니다. 버릴 수만 있습니다."
     else
       msg="[cc] 이전 /cc 작업 기록이 남아 있습니다. 이어 하거나 버릴 수 있습니다."
     fi

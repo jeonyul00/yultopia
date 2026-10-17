@@ -3,7 +3,15 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/inject-handoff.sh" }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/inject-handoff.sh" },
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/cc-hook.sh session-start", "timeout": 10 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/cc-hook.sh prompt-submit", "timeout": 5 }
         ]
       }
     ]

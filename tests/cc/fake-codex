@@ -14,7 +14,7 @@
 #   FAKE_CODEX_SEQ     쉼표로 구분한 호출 순서별 모드 (예: fail_fast,ok). 목록이 끝나면 ok
 #   FAKE_CODEX_RESULT  ok 일 때 -o 파일에 쓸 JSON (기본: 유효한 plan 응답)
 #   FAKE_CODEX_DELAY   slow·fail_slow 모드에서 기다릴 초 (기본 3)
-#   FAKE_CODEX_LOGIN   fail 이면 `login status` 가 로그인 안 됨(exit 1). 그 밖에는 로그인됨(exit 0)
+#   FAKE_CODEX_LOGIN   hang 이면 30초 동안 응답하지 않음(시간 제한 시험). fail 이면 `login status` 가 로그인 안 됨(exit 1). 그 밖에는 로그인됨(exit 0)
 #
 # 모드
 #   ok            exec 이면 thread.started(thread_id fake-thread-1), turn.completed(usage 100/20/10), 결과 기록, exit 0
@@ -35,6 +35,7 @@ mkdir -p "$log" || exit 70
 #   부를 때마다 인자를 $log/login.calls 에 한 줄로 남긴다. FAKE_CODEX_LOGIN=fail 이면 로그인 안 됨(exit 1)
 if [ "${1:-}" = login ]; then
   printf '%s\n' "$*" >> "$log/login.calls"
+  [ "${FAKE_CODEX_LOGIN:-ok}" = hang ] && sleep 30   # 시간 제한 시험: 오래 걸리는 login status
   if [ "${2:-}" = status ] && [ "${FAKE_CODEX_LOGIN:-ok}" != fail ]; then
     echo "Logged in using ChatGPT (fake)"
     exit 0

@@ -169,7 +169,7 @@ test_orphan_grace_counts_from_last_waiter_seen() {
   sleep 2.5                                        # 호출 시작부터는 grace 가 지났다
   run_cc wait --max 1; assert_code 2               # 대기자가 잠깐 기다리다 돌아감 → waiter_last_seen_at = 지금
   run_cc check-orphan; assert_code 0               # 마지막 대기자부터는 아직 grace 안
-  sleep 2.5
+  sleep 3.5
   run_cc check-orphan; assert_code 10
   assert_contains "$OUT" "대기 명령 없이"
   hk_reap
@@ -227,7 +227,7 @@ test_check_orphan_kill_lets_supervisor_finish_with_stubborn_codex() {
   hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
   pg=$(state .running.pgid)
   hk_until 5 pgrep -f -- "fake-codex-stubborn:$FAKE_CODEX_LOG" >/dev/null || _fail "가짜 codex 자식이 없음"
-  sleep 1.5
+  sleep 2.3
   t0=$SECONDS
   run_cc check-orphan --kill; assert_code 10
   [ $((SECONDS - t0)) -le 15 ] || _fail "종료가 너무 오래 걸림 ($((SECONDS - t0))초)"
@@ -242,7 +242,7 @@ test_check_orphan_kill_waits_for_slow_supervisor_finish() {
   FAKE_CODEX_SEQ=hang_stubborn; CC_ORPHAN_GRACE_SECS=1; start_task; run_cc call plan; assert_code 0
   hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
   pg=$(state .running.pgid)
-  sleep 1.5
+  sleep 2.3
   ( . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/common.sh"; . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/state.sh"
     sleep 0.8; cc_state_lock || exit 1; sleep 4; cc_state_unlock ) &
   holder=$!
@@ -565,4 +565,93 @@ test_only_one_active_after_discard_and_restart() {
   gd=$(git rev-parse --absolute-git-dir)
   assert_eq "$(ls -A "$gd/yultopia-cc")" "active"
   assert_eq "$(cat "$(cc_path brief)")" "둘째 작업"
+}
+
+# ==== Task 9 추가 항목 (R23 A–E) ====
+# A. 고아·죽은 기록 정리는 14일 시계를 되돌리지 않는다
+test_dead_record_cleanup_keeps_last_activity() {
+  start_task
+  old=$(hk_iso_ago $((13 * 86400)))
+  hk_fake_running "$(hk_iso_ago 5)" "$old" || _fail "대역 준비 실패"
+  kill -KILL -- "-$FAKE_SUP_PG"; hk_until 3 eval '! hk_group_alive "$FAKE_SUP_PG"' || _fail "그룹이 끝나지 않음"
+  run_cc check-orphan; assert_code 0
+  assert_eq "$(state .running)" "null"; assert_eq "$(state .phase)" "interrupted"
+  assert_eq "$(state .last_activity_at)" "$old" "check-orphan 이 last_activity_at 을 바꿈"
+  # preflight 의 정리도 마찬가지
+  hk_fake_running "$(hk_iso_ago 5)" "$old" || _fail "대역 준비 실패"
+  kill -KILL -- "-$FAKE_SUP_PG"; hk_until 3 eval '! hk_group_alive "$FAKE_SUP_PG"' || _fail "그룹이 끝나지 않음"
+  run_cc preflight
+  assert_eq "$(state .running)" "null"
+  assert_eq "$(state .last_activity_at)" "$old" "preflight 가 last_activity_at 을 바꿈"
+}
+# B. running 이 객체가 아닌 기록은 discard·finish 가 막다른 길이 되지 않는다
+test_discard_and_finish_delete_malformed_running() {
+  for bad in '"garbage"' '[]' '5' '{}' '{"call_id":"x"}' '{"call_id":1,"pgid":"abc"}' '{"call_id":1,"pgid":99999}' '{"call_id":1,"pgid":1,"supervisor_identity":"nobar"}' '{"call_id":1,"pgid":0,"supervisor_identity":"a|b"}'; do
+    start_task "bad$RANDOM"
+    set_state ".running = $bad"
+    run_cc discard; assert_code 0
+    assert_eq "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')" "1"
+    assert_not_contains "$OUT" "다시 시도"
+    assert_no_path "$ACTIVE"
+  done
+  start_task "bad-finish"
+  set_state '.running = "garbage"'
+  run_cc finish; assert_code 0
+  assert_no_path "$ACTIVE"
+}
+test_cleanup_stale_never_deletes_malformed_running() {
+  start_task
+  for bad in '"garbage"' '{"call_id":1,"pgid":"abc"}' '{"call_id":1,"pgid":99999}' '{"call_id":1,"pgid":1,"supervisor_identity":"nobar"}'; do
+    set_state ".running = $bad | .last_activity_at = \"$(hk_stale_iso)\""
+    run_cc cleanup-stale; assert_code 0
+    assert_file_exists "$ACTIVE/state.json"
+    assert_contains "$OUT" "지우지 않았습니다"
+  done
+}
+# C. 감독 프로세스만 KILL 된 고아를 check-orphan --kill 이 스스로 마무리한다
+test_check_orphan_kill_settles_after_supervisor_sigkill() {
+  FAKE_CODEX_SEQ=hang; CC_ORPHAN_GRACE_SECS=1; start_task; run_cc call plan; assert_code 0
+  hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid); cp=$(state .running.codex_pid)
+  kill -KILL "$pg"; hk_until 3 eval '! kill -0 "$pg" 2>/dev/null' || _fail "감독 프로세스가 끝나지 않음"
+  kill -0 "$cp" 2>/dev/null || _fail "codex 가 이미 없음"
+  sleep 2.2
+  run_cc check-orphan --kill; assert_code 10
+  assert_eq "$(hk_lines "$OUT")" "1"
+  hk_assert_terminal 1 interrupted interrupted
+  hk_until 3 eval '! kill -0 "$cp" 2>/dev/null' || _fail "codex 가 남아 있음"
+  hk_until 3 eval '! hk_group_alive "$pg"' || _fail "그룹이 남아 있음"
+}
+# D. 이름 바꾸기는 새 이름만 한 번 나온다
+test_preflight_dirty_rename_lists_new_name_once() {
+  repo=$(make_repo "rename repo"); cd "$repo"
+  git mv base.txt moved.txt
+  run_cc preflight; assert_code 7
+  assert_eq "$(hk_json '.dirty_files | join(",")')" "moved.txt"
+  assert_contains "$(hk_json .message)" "1개"
+}
+# E. codex login status 가 멈춰도 preflight 는 멈추지 않는다
+test_preflight_login_status_timeout() {
+  repo=$(make_repo); cd "$repo"
+  FAKE_CODEX_LOGIN=hang; CC_LOGIN_TIMEOUT_SECS=1
+  export CC_LOGIN_TIMEOUT_SECS
+  t0=$(date +%s)
+  run_cc preflight; assert_code 7
+  t1=$(date +%s)
+  [ $((t1 - t0)) -lt 8 ] || _fail "preflight 가 너무 오래 걸림: $((t1 - t0))초"
+  assert_eq "$(hk_lines "$OUT")" "1"
+  assert_eq "$(hk_json .code)" "not_logged_in"
+  assert_contains "$(hk_json .message)" "시간"
+}
+# 형식이 틀린 running 기록: preflight 는 버리기만 가능하다고 알리고, call 은 버리기를 안내한다
+test_malformed_running_messages_point_to_discard() {
+  start_task
+  set_state '.running = "garbage"'
+  run_cc preflight; assert_code 7
+  assert_eq "$(hk_json .code)" "active_present"
+  assert_contains "$(hk_json .message)" "버릴 수"
+  assert_not_contains "$(hk_json .message)" "이어 하거나"
+  run_cc call plan; assert_code 6
+  assert_contains "$OUT" "discard"
+  assert_not_contains "$OUT" "호출 )"
 }

@@ -162,11 +162,14 @@ _cc_wait_heartbeat() {
 #     감독 프로세스가 먼저 기록했으면 아무것도 바꾸지 않는다.
 #   - 그 뒤 state 가 이 호출에 기록한 status 를 읽어, status 파일이 없거나 다르면 그 값으로 쓴다 (status 파일 == state).
 #   stdout: state 가 기록한 이 호출의 status, 0. 아직 실행 중으로 기록돼 있거나 기록이 없거나 잠금 실패면 출력 없이 1
+# 끝 상태를 쓰는 함수. 기본은 last_activity_at 을 지금으로 바꾼다. 죽은 기록 정리(housekeeping 의 _cc_hk_running_state)만
+# _cc_wait_update_keep_activity 로 바꿔 14일 시계를 되돌리지 않는다. check-orphan --kill (사용자가 시킨 종료)은 갱신한다.
+_CC_WAIT_SETTLE_WRITER=_cc_state_update_nolock
 _cc_wait_settle() {
   local id="$1" st="${2:-}" msg="${3:-}" final dir cur rc=1
   cc_state_lock || return 1
   if [ -n "$st" ]; then
-    _cc_state_update_nolock '
+    $_CC_WAIT_SETTLE_WRITER '
       if (.running | type) == "object" and .running.call_id == $id then
         .last_call = {call_id: $id, kind: .running.kind, status: $st, verdict: null,
                       message: (if $msg == "" then null else $msg end)}

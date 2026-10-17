@@ -163,11 +163,20 @@ _cc_call_is_running() {
   return 0
 }
 
+# running 기록이 온전한가: null 이거나, 양의 정수 pgid 와 "|" 를 가진 감독 프로세스 신원 문자열을 가진 객체.
+# 아니면 실행 여부를 영원히 확인할 수 없는 깨진 기록이다 (discard·finish 만 이것을 근거로 지운다).
+_CC_RUNNING_OK_FILTER='.running == null or ((.running | type) == "object" and ((.running.pgid | type) == "number") and (.running.pgid >= 1) and (.running.pgid == (.running.pgid | floor)) and ((.running.supervisor_identity | type) == "string") and (.running.supervisor_identity | contains("|")))'
+_cc_running_wellformed() { [ "$(_cc_jq_get "$1" "$_CC_RUNNING_OK_FILTER")" = true ]; }
+
 # _cc_call_refusal <kind> <state-json> : 거부해야 하면 한 줄 출력하고 6 (실행 중·호출 상한·연속 반려 상한),
 #   이어 쓸 세션이 없으면 한 줄 출력하고 1 (오류, Ruling R14), 아니면 0
 _cc_call_refusal() {
   local kind="$1" st="$2" total rejects
   if _cc_call_is_running "$st"; then
+    if ! _cc_running_wellformed "$st"; then
+      cc_line "[cc] 이전 호출 기록이 깨져 있어 Codex 실행 여부를 확인할 수 없습니다. discard 로 기록을 버린 뒤 다시 시작하세요."
+      return 6
+    fi
     cc_line "[cc] Codex 호출이 이미 실행 중입니다 (호출 $(_cc_jq_get "$st" '.running.call_id // "?"')). 끝날 때까지 기다리세요."
     return 6
   fi
