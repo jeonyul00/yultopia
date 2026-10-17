@@ -84,6 +84,21 @@ test_status_with_active() {
   start_task
   run_cc status; assert_code 0; assert_contains "$OUT" "planning"
 }
+test_status_shows_codex_tokens() {
+  # SKILL 의 완료 보고는 status 한 줄에서 Codex 토큰 사용량을 읽는다 (스펙 3-5)
+  start_task
+  # 3번째 반려 판단도 status 의 연속 반려 횟수로 한다 (Task 10 리뷰 1·7)
+  set_state '.tokens = {input: 12345, cached_input: 678, output: 910} | .calls_total = 3 | .rejects_in_row = 2'
+  run_cc status; assert_code 0
+  assert_eq "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')" "1"
+  assert_contains "$OUT" "단계: planning, Codex 호출 3회"
+  assert_contains "$OUT" "연속 반려 2회"
+  assert_contains "$OUT" "토큰 입력 12345 (캐시 678) · 출력 910"
+  set_state 'del(.tokens) | del(.rejects_in_row)'
+  run_cc status; assert_code 0
+  assert_contains "$OUT" "연속 반려 0회"
+  assert_contains "$OUT" "토큰 입력 0 (캐시 0) · 출력 0"
+}
 test_unknown_subcommand() {
   run_cc bogus; assert_code 1
 }

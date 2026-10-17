@@ -217,7 +217,8 @@ _cc_call_render() {
         cc_render "$CC_PROMPT_DIR/pm-review.md" "$out" ) ;;
     message)
       v=$(cat "$a/message.md") || return 1
-      ( export CC_T_MESSAGE="$v"; cc_render "$CC_PROMPT_DIR/pm-message.md" "$out" ) ;;
+      ms=$(_cc_jq_get "$st" '.milestone // "?" | tostring')
+      ( export CC_T_MESSAGE="$v" CC_T_MILESTONE="$ms"; cc_render "$CC_PROMPT_DIR/pm-message.md" "$out" ) ;;
     *) return 1 ;;
   esac
 }
@@ -556,18 +557,27 @@ _cc_sup_write_status() {
 
 # state 반영 필터. running 이 아직 이 호출일 때만 바꾼다 (그 사이 wait 의 중단 처리 등으로 running 이
 # 바뀌었으면 덮어쓰지 않는다). 그래서 같은 호출을 두 번 반영해도 두 번째는 아무것도 바꾸지 않는다(토큰 중복 없음).
+# Ruling R27: 마일스톤을 승인·반려하는 것은 review 호출의 결과뿐이다. message 호출(사용자 말·Claude 반대 의견 전달)은
+# diff 를 검수하지 않으므로 그 결과는 "이어가기" 다:
+#   - approve: 마일스톤 번호·milestone_base_tree·rejects_in_row 를 그대로 둔다 (Codex 가 다른 번호를 말해도 지금
+#     마일스톤을 유지하고 다음 review 가 정한다). 아직 마일스톤이 없을 때(계획 호출이 세션만 남기고 실패)만 Codex 번호를 쓴다.
+#   - reject: 연속 반려로 세지 않는다.
+#   - plan 이 함께 오면 milestones_total 만 갱신. plan·done·ask_user verdict 는 review 와 같다.
 _CC_SUP_FINISH_FILTER='
-def apply_verdict($r):
+def apply_verdict($r; $kind):
   if $r.verdict == "plan" then
     .milestone = 1 | .milestones_total = ($r.plan.milestones | length)
     | .milestone_base_tree = .task_base_tree | .phase = "working"
+  elif $r.verdict == "approve" and $kind == "message" then
+    .milestone = (.milestone // $r.milestone) | .phase = "working"
+    | (if $r.plan != null then .milestones_total = ($r.plan.milestones | length) else . end)
   elif $r.verdict == "approve" then
     .milestone = $r.milestone
     | .milestone_base_tree = (.running.review_tree // .milestone_base_tree)
     | .rejects_in_row = 0 | .phase = "working"
     | (if $r.plan != null then .milestones_total = ($r.plan.milestones | length) else . end)
   elif $r.verdict == "reject" then
-    .rejects_in_row = ((.rejects_in_row // 0) + 1) | .phase = "working"
+    (if $kind == "message" then . else .rejects_in_row = ((.rejects_in_row // 0) + 1) end) | .phase = "working"
     | (if $r.plan != null then .milestones_total = ($r.plan.milestones | length) else . end)
   elif $r.verdict == "done" then .phase = "done"
   else .phase = "asking" end;
@@ -575,7 +585,7 @@ if (.running != null and .running.call_id == $id) then
     .tokens = {input: ((.tokens.input // 0) + $ti), cached_input: ((.tokens.cached_input // 0) + $tc),
                output: ((.tokens.output // 0) + $to)}
     | (if $sid != "" then .session_id = $sid else . end)
-    | (if $st == "ok" then apply_verdict($r[0])
+    | (if $st == "ok" then apply_verdict($r[0]; (.running.kind // ""))
        elif $st == "interrupted" then .phase = "interrupted"
        else .phase = "failed" end)
     | .last_call = {call_id: $id, kind: .running.kind, status: $st,

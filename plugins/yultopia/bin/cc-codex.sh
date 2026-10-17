@@ -6,7 +6,7 @@ LIB_DIR="$SELF_DIR/../lib/cc"
 # 감독 프로세스를 띄울 때 쓰는 이 스크립트의 절대 경로
 CC_SELF_ABS="$SELF_DIR/$(basename "$SELF")"
 
-for _cc_lib in common state snapshot proc render call wait housekeeping; do
+for _cc_lib in common state snapshot proc render call wait housekeeping put; do
   . "$LIB_DIR/$_cc_lib.sh" || { echo "[cc] 내부 오류: $LIB_DIR/$_cc_lib.sh 를 불러오지 못했습니다"; exit 1; }
 done
 
@@ -74,8 +74,13 @@ cc_cmd_status() {
   cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다."; return 5; }
   cc_active_path_safe || { cc_line "[cc] 상태 폴더 경로가 비정상입니다."; return 1; }
   a=$(cc_active_dir)
-  line=$(jq -er 'select(type == "object" and (.phase | type == "string") and (.calls_total | type == "number"))
-                 | "[cc] 단계: \(.phase), Codex 호출 \(.calls_total)회"' "$a/state.json" 2>/dev/null) || {
+  # 연속 반려는 SKILL 이 3번째 반려를 알아보는 데, 토큰은 완료 보고에 쓴다 (스펙 3-4, 3-5).
+  # 기록이 없거나 숫자가 아니면 0 으로 보인다
+  line=$(jq -er 'def n: if type == "number" then . else 0 end;
+                 select(type == "object" and (.phase | type == "string") and (.calls_total | type == "number"))
+                 | (.tokens | if type == "object" then . else {} end) as $t
+                 | "[cc] 단계: \(.phase), Codex 호출 \(.calls_total)회, 연속 반려 \(.rejects_in_row | n)회, 토큰 입력 \($t.input | n) (캐시 \($t.cached_input | n)) · 출력 \($t.output | n)"' \
+               "$a/state.json" 2>/dev/null) || {
     cc_line "[cc] 상태 파일을 읽을 수 없습니다."
     cc_err "state.json 이 없거나 형식이 올바르지 않습니다: $a/state.json"
     return 1
@@ -111,6 +116,7 @@ case "$cmd" in
   cleanup-stale) cc_cmd_cleanup_stale "$@" ;;
   preflight)     cc_cmd_preflight "$@" ;;
   discard)       cc_cmd_discard "$@" ;;
+  put)           cc_cmd_put "$@" ;;
   _supervise) cc_cmd_supervise "$@" ;;
   *) cc_line "[cc] 알 수 없는 하위 명령: ${cmd:-(없음)}"; exit 1 ;;
 esac

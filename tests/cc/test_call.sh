@@ -146,10 +146,11 @@ test_verdicts_update_phase_and_rejects() {
   start_task; run_cc call plan; wait_until_status_file 1
   printf '사용자 지시: 계속 진행\n' > "$(cc_path message)"
   FAKE_CODEX_RESULT=$(call_result reject 1); run_cc call message; assert_code 0; wait_until_status_file 2
-  assert_eq "$(state .rejects_in_row)" "1"; assert_eq "$(state .phase)" "working"
+  # Ruling R27: 메시지 호출의 reject 는 검수가 아니므로 연속 반려로 세지 않는다
+  assert_eq "$(state .rejects_in_row)" "0"; assert_eq "$(state .phase)" "working"
   assert_eq "$(state .milestone)" "1"; assert_eq "$(state .last_call.verdict)" "reject"
   FAKE_CODEX_RESULT=$(call_result ask_user null); run_cc call message; assert_code 0; wait_until_status_file 3
-  assert_eq "$(state .phase)" "asking"; assert_eq "$(state .rejects_in_row)" "1"
+  assert_eq "$(state .phase)" "asking"; assert_eq "$(state .rejects_in_row)" "0"
   FAKE_CODEX_RESULT=$(call_result done null); run_cc call message; assert_code 0; wait_until_status_file 4
   assert_eq "$(state .phase)" "done"
   assert_eq "$(state .last_call.status)" "ok"; assert_eq "$(state .last_call.verdict)" "done"
@@ -158,6 +159,66 @@ test_verdicts_update_phase_and_rejects() {
   assert_eq "$(state .session_id)" "fake-thread-1"
   assert_eq "$(sed -n 2p "$FAKE_CODEX_LOG/4.argv")" "resume"
   assert_contains "$(cat "$FAKE_CODEX_LOG/2.stdin")" "사용자 지시: 계속 진행"
+}
+
+# ---- Ruling R27: call message 의 결과는 검수가 아니다 (마일스톤은 call review 로만 승인·반려) ----
+test_message_approve_same_milestone_continues_without_review() {
+  start_task; run_cc call plan; wait_until_status_file 1
+  set_state '.rejects_in_row = 2 | .milestone_base_tree = "base-before-message"'
+  printf '사용자 지시: 방향 수정\n' > "$(cc_path message)"
+  plan3='{"overview":"바뀐 계획","milestones":[{"id":1,"title":"a","done_criteria":"x"},{"id":2,"title":"b","done_criteria":"y"},{"id":3,"title":"c","done_criteria":"z"}]}'
+  FAKE_CODEX_RESULT=$(call_result approve 1 "$plan3"); run_cc call message; assert_code 0
+  wait_until_status_file 2 || _fail "calls/2/status 가 생기지 않음"
+  assert_eq "$(cat "$ACTIVE/calls/2/status")" "ok"
+  assert_eq "$(state .milestone)" "1"
+  assert_eq "$(state .rejects_in_row)" "2"
+  assert_eq "$(state .milestone_base_tree)" "base-before-message"
+  assert_eq "$(state .phase)" "working"
+  assert_eq "$(state .milestones_total)" "3"
+  assert_eq "$(state .last_call.kind)" "message"; assert_eq "$(state .last_call.verdict)" "approve"
+}
+test_message_approve_other_milestone_keeps_current() {
+  start_task; run_cc call plan; wait_until_status_file 1
+  set_state '.milestone = 2 | .rejects_in_row = 1 | .milestone_base_tree = "m2-base"'
+  printf '사용자 지시: 다음으로 넘어가\n' > "$(cc_path message)"
+  FAKE_CODEX_RESULT=$(call_result approve 3); run_cc call message; assert_code 0
+  wait_until_status_file 2 || _fail "calls/2/status 가 생기지 않음"
+  assert_eq "$(state .milestone)" "2"
+  assert_eq "$(state .milestone_base_tree)" "m2-base"
+  assert_eq "$(state .rejects_in_row)" "1"
+  assert_eq "$(state .phase)" "working"
+}
+test_message_reject_does_not_count_toward_reject_limit() {
+  start_task; run_cc call plan; wait_until_status_file 1
+  set_state '.rejects_in_row = 2'
+  printf 'Claude 반대 의견\n' > "$(cc_path message)"
+  FAKE_CODEX_RESULT=$(call_result reject 1); run_cc call message; assert_code 0
+  wait_until_status_file 2 || _fail "calls/2/status 가 생기지 않음"
+  assert_eq "$(state .rejects_in_row)" "2"; assert_eq "$(state .phase)" "working"
+  assert_eq "$(state .milestone)" "1"
+  # 검수 요청은 아직 막히지 않고, 검수의 reject 는 센다
+  printf '%s' "$REVIEW_REPORT" > "$(cc_path report)"
+  FAKE_CODEX_RESULT=$(call_result reject 1); run_cc call review; assert_code 0
+  wait_until_status_file 3 || _fail "calls/3/status 가 생기지 않음"
+  assert_eq "$(state .rejects_in_row)" "3"
+}
+test_message_approve_without_milestone_adopts_codex_milestone() {
+  # 계획 호출이 세션만 남기고 실패한 경우 (milestone 이 아직 없음): Codex 가 준 번호를 쓴다
+  start_task; set_state '.session_id = "fake-thread-1"'
+  printf '사용자 지시\n' > "$(cc_path message)"
+  FAKE_CODEX_RESULT=$(call_result approve 1); run_cc call message; assert_code 0
+  wait_until_status_file 1 || _fail "calls/1/status 가 생기지 않음"
+  assert_eq "$(state .milestone)" "1"
+  assert_eq "$(state .rejects_in_row)" "0"
+  assert_eq "$(state .milestone_base_tree)" "null"
+}
+test_message_prompt_names_current_milestone() {
+  start_task; run_cc call plan; wait_until_status_file 1
+  set_state '.milestone = 2'
+  printf '사용자 지시\n' > "$(cc_path message)"
+  FAKE_CODEX_RESULT=$(call_result approve 2); run_cc call message; assert_code 0
+  wait_until_status_file 2 || _fail "calls/2/status 가 생기지 않음"
+  assert_contains "$(cat "$FAKE_CODEX_LOG/2.stdin")" "지금 진행 중인 마일스톤: 2"
 }
 test_supervisor_records_codex_identity() {
   FAKE_CODEX_SEQ=hang; start_task

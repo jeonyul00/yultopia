@@ -56,5 +56,12 @@ test_prompts_state_pm_rules() {
   assert_contains "$r" "파일을 만들거나 고치지"
   for v in approve reject done ask_user; do assert_contains "$r" "$v"; done
   assert_contains "$(cat "$TPL_DIR/pm-message.md")" "최우선"
+  # Ruling R27: 메시지 답변은 검수가 아니다. 이어가기 = 지금 마일스톤 번호로 approve
+  m=$(cat "$TPL_DIR/pm-message.md")
+  assert_contains "$m" "지금 진행 중인 마일스톤: {{MILESTONE}}"
+  assert_contains "$m" "검수가 아닙니다"
+  assert_contains "$m" "verdict \"approve\""
+  assert_contains "$m" "verdict \"ask_user\""
+  assert_contains "$m" "plan 에"
   assert_contains "$(cat "$TPL_DIR/pm-format-retry.md")" "JSON"
 }
