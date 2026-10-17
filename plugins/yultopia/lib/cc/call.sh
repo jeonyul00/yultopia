@@ -113,27 +113,53 @@ _cc_call_read_state() {
     "$1/state.json" 2>/dev/null
 }
 
-# _cc_call_is_running <state-json> : 0 = 실행 중으로 본다(살아 있음 또는 판단 불가) / 1 = 실행 중 아님
-#   running 이 null 이면 아님. 하나라도 살아 있거나 판단할 수 없으면 실행 중.
-#   기록된 감독 프로세스와 codex(기록돼 있으면)가 둘 다 확실히 끝났어도(없음·PID 재사용) 그 그룹에 무언가
-#   (codex 의 자식, 기록 전에 실행된 codex 등)가 남아 있을 수 있다. 그룹에 신호 0 을 보내 확인만 하고
-#   (아무것도 보내지 않음), 그룹이 확실히 비었을 때만 낡은 기록으로 본다 (낡은 기록 정리는 Task 8 몫).
-#   그룹이 비어 있지 않거나 판단할 수 없으면 실행 중: 남은 것이 사는 동안 두 번째 Codex 를 띄우지 않는다.
-#   거부는 안전하다. 이 확인되지 않은 근거로 무언가를 죽이지는 않는다.
-_cc_call_is_running() {
+# _cc_call_liveness <state-json> : 기록된 호출이 아직 돌 수 있는지 네 가지로 나눈다.
+#   call·wait·check-orphan·cleanup-stale·discard·finish·preflight 가 모두 이 하나로 판단한다 (Task 8 addendum B).
+#   _CC_LIVENESS = none      running 이 null (실행 중인 호출이 없다고 명시돼 있음)
+#                | alive     기록된 감독 프로세스나 codex 중 하나라도 신원 확인상 살아 있음
+#                | dead      둘 다 확실히 없고(R8 의 1: 없음·PID 재사용) 그 그룹도 확실히 비었음
+#                | uncertain 그 밖: ps 실패, 기록 형식 오류, 또는 둘 다 확실히 없는데 그룹이 비어 있지 않거나 판단 불가
+#   _CC_LIVENESS_LEFTOVER = 1 : uncertain 중 "감독 프로세스·codex 는 확실히 없는데 그룹에 무언가 남아 있음"
+#     (codex 의 자식, 기록 전에 실행된 codex 등. 우리 것인지 확인할 수 없으므로 죽이지 않는다: R8)
+#   _CC_LIVENESS_PGID = 기록된 pgid (형식 확인 전 값)
+#   그룹은 신호 0 으로 있는지만 본다 (아무것도 보내지 않음). $(...) 안에서 부르면 결과 변수가 사라진다.
+_cc_call_liveness() {
   local st="$1" pg sid cp cid r1 r2=1
-  [ "$(_cc_jq_get "$st" '.running == null')" = "true" ] && return 1
+  _CC_LIVENESS=uncertain; _CC_LIVENESS_LEFTOVER=0; _CC_LIVENESS_PGID=""
+  if [ "$(_cc_jq_get "$st" '.running == null')" = "true" ]; then
+    _CC_LIVENESS=none; return 0
+  fi
   pg=$(_cc_jq_get "$st" '.running.pgid // empty | tostring')
   sid=$(_cc_jq_get "$st" '.running.supervisor_identity // empty')
   cp=$(_cc_jq_get "$st" '.running.codex_pid // empty | tostring')
   cid=$(_cc_jq_get "$st" '.running.codex_identity // empty')
+  _CC_LIVENESS_PGID=$pg
   cc_proc_alive_verified "$pg" "$sid"; r1=$?
   if [ -n "$cp" ]; then
     cc_proc_alive_verified "$cp" "$cid"; r2=$?
   fi
-  [ "$r1" -eq 1 ] && [ "$r2" -eq 1 ] || return 0
-  # r1 이 1 이면 pg 는 형식이 맞는 PID 다 (형식 오류는 2)
-  _cc_proc_probe "-$pg"; [ $? -eq 1 ] && return 1
+  if [ "$r1" -eq 0 ] || [ "$r2" -eq 0 ]; then
+    _CC_LIVENESS=alive; return 0
+  fi
+  if [ "$r1" -eq 1 ] && [ "$r2" -eq 1 ]; then
+    # r1 이 1 이면 pg 는 형식이 맞는 PID 다 (형식 오류는 2)
+    _cc_proc_probe "-$pg"
+    case $? in
+      1) _CC_LIVENESS=dead ;;
+      0) _CC_LIVENESS_LEFTOVER=1 ;;
+    esac
+  fi
+  return 0
+}
+
+# _cc_call_is_running <state-json> : 0 = 실행 중으로 본다(alive 또는 uncertain) / 1 = 실행 중 아님(none 또는 dead)
+#   기록된 감독 프로세스와 codex 가 둘 다 확실히 끝났어도 그룹에 무언가 남아 있으면 실행 중: 남은 것이 사는 동안
+#   두 번째 Codex 를 띄우지 않는다. 거부는 안전하다. 이 확인되지 않은 근거로 무언가를 죽이지는 않는다.
+_cc_call_is_running() {
+  _cc_call_liveness "$1"
+  case "$_CC_LIVENESS" in
+    none|dead) return 1 ;;
+  esac
   return 0
 }
 

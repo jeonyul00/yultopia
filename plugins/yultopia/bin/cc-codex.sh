@@ -6,7 +6,7 @@ LIB_DIR="$SELF_DIR/../lib/cc"
 # 감독 프로세스를 띄울 때 쓰는 이 스크립트의 절대 경로
 CC_SELF_ABS="$SELF_DIR/$(basename "$SELF")"
 
-for _cc_lib in common state snapshot proc render call wait; do
+for _cc_lib in common state snapshot proc render call wait housekeeping; do
   . "$LIB_DIR/$_cc_lib.sh" || { echo "[cc] 내부 오류: $LIB_DIR/$_cc_lib.sh 를 불러오지 못했습니다"; exit 1; }
 done
 
@@ -92,10 +92,9 @@ cc_cmd_ack_rejects() {
   cc_line "[cc] 연속 반려 횟수를 0으로 되돌렸습니다. 검수를 다시 요청할 수 있습니다."
 }
 
+# 사용자가 완료를 확인했을 때: Codex 가 돌 수 있으면 6 으로 거부, 아니면 active 삭제 (housekeeping.sh)
 cc_cmd_finish() {
-  cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다."; return 0; }
-  cc_delete_active || { cc_line "[cc] 상태 폴더 경로가 비정상이라 삭제하지 않았습니다."; return 1; }
-  cc_line "[cc] 작업을 마무리하고 상태를 정리했습니다."
+  _cc_hk_remove_active "[cc] 작업을 마무리하고 상태를 정리했습니다."
 }
 
 cmd="${1:-}"
@@ -108,6 +107,10 @@ case "$cmd" in
   call)   cc_cmd_call "$@" ;;
   ack-rejects) cc_cmd_ack_rejects "$@" ;;
   wait)   cc_cmd_wait "$@" ;;
+  check-orphan)  cc_cmd_check_orphan "$@" ;;
+  cleanup-stale) cc_cmd_cleanup_stale "$@" ;;
+  preflight)     cc_cmd_preflight "$@" ;;
+  discard)       cc_cmd_discard "$@" ;;
   _supervise) cc_cmd_supervise "$@" ;;
   *) cc_line "[cc] 알 수 없는 하위 명령: ${cmd:-(없음)}"; exit 1 ;;
 esac
