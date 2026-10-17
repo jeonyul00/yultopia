@@ -615,7 +615,8 @@ test_preflight_cleans_dead_record_and_reports_active() {
   hk_assert_terminal 1 interrupted interrupted
 }
 test_discard_and_finish_delete_unreadable_record() {
-  # 사용자가 직접 고른 삭제: 상태 파일을 읽을 수 없으면 지킬 실행 기록도 없으므로 지운다 (막다른 길 없음)
+  # 사용자가 직접 고른 삭제: 상태 파일을 읽을 수 없어도 이 작업의 프로세스가 없음을 확인하면 지운다 (막다른 길 없음).
+  #   R30 이 R22 를 대체: 프로세스가 있거나 확인하지 못하면 지우지 않는다 (test_discard_broken_record_*)
   start_task
   echo '{bad' > "$ACTIVE/state.json"
   run_cc discard; assert_code 0
@@ -704,7 +705,7 @@ test_dead_record_cleanup_keeps_last_activity() {
   assert_eq "$(state .running)" "null"
   assert_eq "$(state .last_activity_at)" "$old" "preflight 가 last_activity_at 을 바꿈"
 }
-# B. running 이 객체가 아닌 기록은 discard·finish 가 막다른 길이 되지 않는다
+# B. running 이 객체가 아닌 기록은 discard·finish 가 막다른 길이 되지 않는다 (이 작업의 프로세스가 없을 때. R30)
 test_discard_and_finish_delete_malformed_running() {
   for bad in '"garbage"' '[]' '5' '{}' '{"call_id":"x"}' '{"call_id":1,"pgid":"abc"}' '{"call_id":1,"pgid":99999}' '{"call_id":1,"pgid":1,"supervisor_identity":"nobar"}' '{"call_id":1,"pgid":0,"supervisor_identity":"a|b"}'; do
     start_task "bad$RANDOM"
@@ -774,4 +775,95 @@ test_malformed_running_messages_point_to_discard() {
   run_cc call plan; assert_code 6
   assert_contains "$OUT" "discard"
   assert_not_contains "$OUT" "호출 )"
+}
+
+# ==== Codex 리뷰 1 (R30): check-orphan --kill 이 KILL 뒤에도 남으면(3) 프로세스 기록을 남긴다 ====
+test_check_orphan_kill_keeps_process_record_when_kill_is_not_confirmed() {
+  CC_ORPHAN_GRACE_SECS=1; start_task; hk_source_libs
+  hk_fake_running "$(hk_iso_ago 30)" "$(hk_iso_ago 30)" || _fail "대역 준비 실패"
+  pg=$FAKE_SUP_PG
+  _cc_wait_stop_group() { return 3; }        # 테스트 전용 대역: 신호는 보내지 않고 "KILL 뒤에도 남음" 만 돌려준다
+  cc_cmd_check_orphan --kill > "$TMP/co.out" 2>/dev/null; rc=$?
+  assert_eq "$rc" "10"
+  assert_eq "$(hk_lines "$(cat "$TMP/co.out")")" "1"; assert_contains "$(cat "$TMP/co.out")" "KILL 뒤에도"
+  assert_eq "$(state .last_call.status)" "interrupted"; assert_eq "$(state .phase)" "interrupted"
+  assert_eq "$(cat "$ACTIVE/calls/1/status" 2>/dev/null)" "interrupted"
+  assert_eq "$(state .running.call_id)" "1" "running 이 지워짐"
+  assert_eq "$(state .running.pgid)" "$pg"; assert_eq "$(state .running.stop_failed)" "true"
+  kill -0 "$pg" 2>/dev/null || _fail "대역이 죽음 (테스트 전제 깨짐)"
+  # 다음 확인에서도 계속 알리고, 버리기·마무리·오래된 기록 정리는 지우지 않는다
+  run_cc check-orphan; assert_code 10
+  run_cc discard; assert_code 6
+  run_cc finish; assert_code 6
+  set_state ".last_activity_at = \"$(hk_stale_iso)\""
+  run_cc cleanup-stale; assert_code 0; assert_contains "$OUT" "지우지 않았습니다"
+  assert_file_exists "$ACTIVE/state.json"
+  # 정말 사라지면 기록만 정리 (끝 상태는 그대로)
+  kill -KILL -- "-$pg"; hk_until 3 eval '! hk_group_alive "$pg"' || _fail "그룹이 끝나지 않음"
+  run_cc check-orphan; assert_code 0
+  assert_eq "$(state .running)" "null"
+  assert_eq "$(state .last_call.status)" "interrupted"; assert_contains "$(state .last_call.message)" "KILL 뒤에도"
+}
+
+# ==== Codex 리뷰 3 (R30, R22 대체): 읽을 수 없거나 깨진 기록은 이 작업의 프로세스가 없음을 확인한 뒤에만 버린다 ====
+test_discard_broken_record_refuses_while_task_process_runs() {
+  FAKE_CODEX_SEQ=hang; start_task "my repo 한글"; run_cc call plan; assert_code 0
+  hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid); cx=$(state .running.codex_pid)
+  cp "$ACTIVE/state.json" "$TMP/state.bak"
+  for bad in unreadable malformed; do
+    if [ "$bad" = unreadable ]; then echo '{bad' > "$ACTIVE/state.json"; else set_state '.running = "garbage"'; fi
+    for cmd in discard finish; do
+      run_cc "$cmd"; assert_code 6
+      assert_eq "$(hk_lines "$OUT")" "1" "$bad/$cmd"
+      assert_contains "$OUT" "$cx"
+      assert_contains "$OUT" "ps -o pid,command -g $pg"
+      assert_not_contains "$OUT" "Codex가 실행 중입니다"
+      assert_file_exists "$ACTIVE/brief.md"
+    done
+    kill -0 "$cx" 2>/dev/null || _fail "$bad: Codex 를 죽임"
+    kill -0 "$pg" 2>/dev/null || _fail "$bad: 감독 프로세스를 죽임"
+    cp "$TMP/state.bak" "$ACTIVE/state.json"
+  done
+  # 그 프로세스가 정말 없으면 지금처럼 지운다
+  hk_reap "$pg"
+  echo '{bad' > "$ACTIVE/state.json"
+  run_cc discard; assert_code 0
+  assert_no_path "$ACTIVE"
+}
+test_discard_broken_record_sees_supervisor_before_codex_starts() {
+  # 감독 프로세스는 codex 를 띄우기 전·재시도 사이에도 명령줄에 이 작업의 active 경로를 가진다
+  FAKE_CODEX_SEQ=hang; start_task; run_cc call plan; assert_code 0
+  hk_until 5 hk_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid)
+  assert_contains "$(LC_ALL=C ps -ww -o command= -p "$pg")" "_supervise 1 $ACTIVE"
+  hk_reap "$pg"
+  # 감독 프로세스 모양의 프로세스 하나만 있어도 지우지 않는다 (신호도 보내지 않는다)
+  sx=$(cc_spawn_group "$TMP/sx.log" perl -e 'sleep 60' -- "$CC_BIN" _supervise 1 "$ACTIVE") || _fail "대역 준비 실패"
+  echo '{bad' > "$ACTIVE/state.json"
+  run_cc discard; assert_code 6
+  assert_eq "$(hk_lines "$OUT")" "1"; assert_contains "$OUT" "$sx"
+  assert_file_exists "$ACTIVE/brief.md"
+  kill -0 "$sx" 2>/dev/null || _fail "대역을 죽임"
+  # 다른 저장소의 경로(이 active 로 시작하지만 다른 폴더)는 이 작업의 것이 아니다
+  kill -KILL -- "-$sx"; hk_until 3 eval '! hk_group_alive "$sx"'
+  ox=$(cc_spawn_group "$TMP/ox.log" perl -e 'sleep 60' -- -o "${ACTIVE}-old/calls/1/result.json") || _fail "대역 준비 실패"
+  run_cc discard; assert_code 0
+  assert_no_path "$ACTIVE"
+  kill -KILL -- "-$ox" 2>/dev/null
+}
+test_discard_broken_record_refuses_when_process_scan_fails() {
+  start_task
+  hk_fake_ps_fail
+  echo '{bad' > "$ACTIVE/state.json"
+  PATH="$TMP/bin:$PATH" run_cc discard; assert_code 6
+  assert_eq "$(hk_lines "$OUT")" "1"; assert_contains "$OUT" "확인하지 못해"
+  PATH="$TMP/bin:$PATH" run_cc finish; assert_code 6
+  assert_file_exists "$ACTIVE/brief.md"
+  printf '{}' > "$ACTIVE/state.json"; set_state '.running = {"call_id":1,"pgid":"abc"}'
+  PATH="$TMP/bin:$PATH" run_cc discard; assert_code 6
+  assert_file_exists "$ACTIVE/brief.md"
+  # 자동 정리(cleanup-stale)는 여전히 깨진 기록을 지우지 않는다
+  run_cc cleanup-stale; assert_code 0
+  assert_file_exists "$ACTIVE/brief.md"
 }

@@ -19,6 +19,8 @@
 #   CC_POLL_SECS 마다 calls/<id>/status 를 먼저 보고 state 를 읽는다 (감독 프로세스는 state → status 순서로 쓴다).
 #   - running 이 더 이상 이 호출이 아니면 끝난 것: state 의 last_call 로 알린다. status 파일이 없거나 state 와
 #     다르면 잠금 안에서 state 값으로 맞춘다 (status 파일 == state).
+#     running 이 이 호출이어도 stop_failed (끝 상태는 기록됐지만 종료를 확인하지 못해 프로세스 기록만 남김, R30) 면
+#     끝난 것으로 보고 같은 방법으로 알린다 (기다리지 않는다).
 #   - running 이 아직 이 호출이면 기록된 감독 프로세스·codex 와 그 그룹이 살아 있는지 본다 (_cc_call_is_running).
 #     감독 프로세스·codex 가 둘 다 확실히 없고(R8: "확실히 없음" 만 인정) 그룹도 비었으면 기록 없이 죽은 호출이다.
 #     running.call_id 가 맞을 때만 interrupted 로 기록하고 (Task 8 의 dead 정리와 같은 값) status 파일을 state 에서
@@ -53,6 +55,7 @@
 #      감독 프로세스가 이미 없으면 기록된 codex 신원으로 cc_kill_group_via_member.
 #   4) 끝냈으면 잠금 안에서: running.call_id 가 아직 이 호출일 때만 interrupted 로 기록하고 (감독 프로세스가 기록 전에
 #      끝난 경우), state 가 이 호출에 기록한 값으로 status 파일을 맞춘다. 감독 프로세스가 먼저 기록했으면 그 값을 따른다.
+#      KILL 뒤에도 남았으면(3) 끝 상태는 같은 방법으로 기록하되 running 은 stop_failed 로 남긴다 (R30).
 #   5) 확인할 수 없어 아무 신호도 보내지 못했으면(R8 의 2, 또는 감독 프로세스·codex 는 없는데 그룹에 확인할 수 없는
 #      것이 남음) 상태를 바꾸지 않는다. 호출은 계속되고 Task 8 의 고아 확인이 맡는다.
 
@@ -95,10 +98,11 @@ _cc_wait_running_is() {
 #   pgid 와 신원을 _CC_WAIT_C_PG / _CC_WAIT_C_SID 에 기억한다 (jq 한 번). 아니면 1 (기억은 그대로 둔다).
 #   중단 신호를 받으면 state 를 다시 읽지 않고 이 값으로 바로 검증된 TERM 을 보낸다 (최종 리뷰 Important 1: 지연 줄이기).
 #   같은 호출의 pgid·감독 프로세스 신원은 바뀌지 않으므로 어느 확인 때 기억한 값이든 같다.
+#   running.stop_failed 기록(끝 상태는 기록됐고 프로세스 기록만 남음, R30)은 끝난 호출이다: 1 (기다리지 않는다).
 _cc_wait_running_cache() {
   local out yes="" pg="" sid=""
   out=$(printf '%s' "$1" | jq -r --argjson id "$_CC_WAIT_ID" '
-      if (.running | type) == "object" and .running.call_id == $id
+      if (.running | type) == "object" and .running.call_id == $id and .running.stop_failed != true
       then "yes", (.running.pgid // "" | tostring), (.running.supervisor_identity // "" | tostring)
       else "no" end' 2>/dev/null)
   { IFS= read -r yes; IFS= read -r pg; IFS= read -r sid; } <<EOF
@@ -178,29 +182,38 @@ _cc_wait_heartbeat() {
     || cc_err "[cc] 대기자 확인 시각을 기록하지 못했습니다"
 }
 
-# _cc_wait_settle <id> [<status> <message>] : 잠금 안에서 호출 <id> 의 끝 상태를 정리한다.
-#   - status 를 주면 running 이 아직 이 호출일 때만 그 값으로 끝낸다 (running=null, last_call, phase).
-#     감독 프로세스가 먼저 기록했으면 아무것도 바꾸지 않는다.
+# _cc_wait_settle <id> [<status> <message> [keep]] : 잠금 안에서 호출 <id> 의 끝 상태를 정리한다.
+#   - status 를 주면 running 이 아직 이 호출일 때만 바꾼다. 감독 프로세스가 먼저 끝 상태를 기록했으면 그것을 따른다.
+#       keep 없음 = 그 호출의 프로세스가 사라진 것을 확인함 (검증된 종료 0, 또는 dead):
+#         끝 상태가 없으면 그 값으로 끝낸다 (running=null, last_call, phase).
+#         이미 끝 상태가 기록된 stop_failed 기록이면 running 만 지운다 (끝 상태·메시지는 그대로, R30).
+#       keep = 종료를 확인하지 못함 (KILL 뒤에도 남음 3, R30): 끝 상태가 없으면 그 값으로 기록하되 running 은 지우지 않고
+#         stop_failed 로 표시한다 (pgid·신원 그대로 → 훅·고아 확인·preflight·버리기·정리가 계속 본다). 이미 stop_failed 면 그대로.
 #   - 그 뒤 state 가 이 호출에 기록한 status 를 읽어, status 파일이 없거나 다르면 그 값으로 쓴다 (status 파일 == state).
-#   stdout: state 가 기록한 이 호출의 status, 0. 아직 실행 중으로 기록돼 있거나 기록이 없거나 잠금 실패면 출력 없이 1
+#   stdout: state 가 기록한 이 호출의 status, 0. 아직 끝 상태 없이 실행 중으로 기록돼 있거나 기록이 없거나 잠금 실패면 출력 없이 1
 # 끝 상태를 쓰는 함수. 기본은 last_activity_at 을 지금으로 바꾼다. 죽은 기록 정리(housekeeping 의 _cc_hk_running_state)만
 # _cc_wait_update_keep_activity 로 바꿔 14일 시계를 되돌리지 않는다. check-orphan --kill (사용자가 시킨 종료)은 갱신한다.
 _CC_WAIT_SETTLE_WRITER=_cc_state_update_nolock
 _cc_wait_settle() {
-  local id="$1" st="${2:-}" msg="${3:-}" final dir cur rc=1
+  local id="$1" st="${2:-}" msg="${3:-}" keep=0 final dir cur rc=1
+  [ "${4:-}" = keep ] && keep=1
   cc_state_lock || return 1
   if [ -n "$st" ]; then
     $_CC_WAIT_SETTLE_WRITER '
       if (.running | type) == "object" and .running.call_id == $id then
-        .last_call = {call_id: $id, kind: .running.kind, status: $st, verdict: null,
-                      message: (if $msg == "" then null else $msg end)}
-        | .phase = (if $st == "interrupted" then "interrupted" else "failed" end)
-        | .running = null
-      else . end' --argjson id "$id" --arg st "$st" --arg msg "$msg" \
+        if .running.stop_failed == true then
+          (if $keep == 1 then . else .running = null end)
+        else
+          .last_call = {call_id: $id, kind: .running.kind, status: $st, verdict: null,
+                        message: (if $msg == "" then null else $msg end)}
+          | .phase = (if $st == "interrupted" then "interrupted" else "failed" end)
+          | (if $keep == 1 then .running.stop_failed = true else .running = null end)
+        end
+      else . end' --argjson id "$id" --arg st "$st" --arg msg "$msg" --argjson keep "$keep" \
       || cc_err "[cc] 호출 $id 의 끝 상태를 기록하지 못했습니다"
   fi
   final=$(jq -r --argjson id "$id" '
-      if (.running | type) == "object" and .running.call_id == $id then empty
+      if (.running | type) == "object" and .running.call_id == $id and .running.stop_failed != true then empty
       elif (.last_call | type) == "object" and .last_call.call_id == $id
            and (.last_call.status | type) == "string" and (.last_call.status | test("^[a-z_]+$"))
         then .last_call.status
@@ -399,7 +412,8 @@ _cc_wait_interrupt_conclude() {
         _CC_WAIT_LINE="[cc] 중단됨: Codex 호출 $id 은(는) 중단 전에 이미 끝나 있었습니다 ($final)"
       fi ;;
     3)
-      _cc_wait_settle "$id" interrupted "[cc] 중단됨: 일부 Codex 프로세스가 KILL 뒤에도 남아 있습니다 (호출 $id)." >/dev/null
+      # 종료를 확인하지 못했다: 끝 상태는 기록하되 프로세스 기록(running)은 남긴다 (R30)
+      _cc_wait_settle "$id" interrupted "[cc] 중단됨: 일부 Codex 프로세스가 KILL 뒤에도 남아 있습니다 (호출 $id)." keep >/dev/null
       _CC_WAIT_LINE="[cc] 중단됨: 일부 Codex 프로세스가 KILL 뒤에도 남아 있습니다 (호출 $id)" ;;
     *)
       _CC_WAIT_LINE="[cc] 중단됨: Codex 종료를 확인하지 못해 상태를 바꾸지 않았습니다 (호출 $id)" ;;
@@ -414,9 +428,10 @@ _cc_wait_in_main_shell() {
 }
 
 # state 잠금의 owner 가 이 셸($$)인가 (bash 내장 read 만 쓴다). 잠금 owner 는 잠금을 잡은 셸의 PID 다 (state.sh)
+#   잠금 자리나 owner 가 심볼릭 링크면 따라가 읽지 않는다 (Codex 리뷰 2)
 _cc_wait_owns_lock() {
-  local o="" f="$_CC_WAIT_ACTIVE/state.lock/owner"
-  [ -n "${_CC_WAIT_ACTIVE:-}" ] && [ -f "$f" ] || return 1
+  local o="" d="$_CC_WAIT_ACTIVE/state.lock" f="$_CC_WAIT_ACTIVE/state.lock/owner"
+  [ -n "${_CC_WAIT_ACTIVE:-}" ] && [ ! -L "$d" ] && [ -d "$d" ] && [ ! -L "$f" ] && [ -f "$f" ] || return 1
   IFS= read -r o < "$f" 2>/dev/null
   [ "$o" = "$$" ]
 }

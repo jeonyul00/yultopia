@@ -468,3 +468,61 @@ test_result_validator_follows_r12() {
   cc_result_valid "$TMP/없는파일.json" && _fail "없는 파일을 받음"
   return 0
 }
+
+# ---- Codex 리뷰 4 (R30): 호출 종류·verdict 별로 절차가 다음에 할 일이 있는 결과만 받는다 ----
+test_result_validator_checks_kind_and_verdict_content() {
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
+  f="$TMP/r.json"
+  ok_k()  { printf '%s\n' "$2" > "$f"; cc_result_valid "$f" "$1" || _fail "받아야 함 ($1): $2"; }
+  bad_k() { printf '%s\n' "$2" > "$f"; cc_result_valid "$f" "$1" && _fail "거부해야 함 ($1): $2"; return 0; }
+  plan1='{"overview":"o","milestones":[{"id":1,"title":"a","done_criteria":"x"}]}'
+  empty='{"overview":"o","milestones":[]}'
+  # plan 호출: plan(마일스톤 1개 이상, 지시, milestone 1 또는 null) 또는 ask_user(질문) 만
+  ok_k plan "$(call_result plan 1 "$plan1")"
+  ok_k plan "$(call_result plan 1 "$plan1" | jq -c '.milestone = null')"
+  ok_k plan "$(call_result ask_user null)"
+  bad_k plan "$(call_result plan 1 "$empty")"
+  bad_k plan "$(call_result plan 1 "$plan1" | jq -c '.instruction = null')"
+  bad_k plan "$(call_result plan 1 "$plan1" | jq -c '.instruction = "  "')"
+  bad_k plan "$(call_result plan 2 "$plan1")"
+  bad_k plan "$(call_result ask_user null | jq -c '.question = null')"
+  bad_k plan "$(call_result ask_user null | jq -c '.question = ""')"
+  bad_k plan "$(call_result done null)"
+  bad_k plan "$(call_result approve 1)"
+  bad_k plan "$(call_result reject 1)"
+  # review 호출: approve(정수 milestone, 지시), reject(지시), done, ask_user(질문)
+  ok_k review "$(call_result approve 2)"
+  ok_k review "$(call_result approve 2 "$plan1")"
+  ok_k review "$(call_result reject 1)"
+  ok_k review "$(call_result done null)"
+  ok_k review "$(call_result ask_user null)"
+  bad_k review "$(call_result approve 2 | jq -c '.instruction = null')"
+  bad_k review "$(call_result approve null)"
+  bad_k review "$(call_result reject 1 | jq -c '.instruction = ""')"
+  bad_k review "$(call_result ask_user null | jq -c '.question = null')"
+  bad_k review "$(call_result plan 1 "$plan1")"
+  # message 호출: approve(지시), ask_user(질문), plan(마일스톤 1개 이상 + 지시). done·reject 는 R27 대로 받는다
+  ok_k message "$(call_result approve 1)"
+  ok_k message "$(call_result ask_user null)"
+  ok_k message "$(call_result plan 1 "$plan1")"
+  ok_k message "$(call_result done null)"
+  ok_k message "$(call_result reject 1)"
+  bad_k message "$(call_result approve 1 | jq -c '.instruction = null')"
+  bad_k message "$(call_result ask_user null | jq -c '.question = "   "')"
+  bad_k message "$(call_result plan 1 "$empty")"
+  bad_k message "$(call_result plan 1 "$plan1" | jq -c '.instruction = null')"
+  # 거부 이유는 한 줄이고 무엇이 틀렸는지 말한다 (형식 재요청 프롬프트에 그대로 넣는다)
+  printf '%s\n' "$(call_result plan 1 "$empty")" > "$f"
+  why=$(cc_result_problem "$f" plan); assert_eq "$?" "1"
+  assert_eq "$(call_lines "$why")" "1"; assert_contains "$why" "마일스톤"
+  printf '%s\n' "$(call_result ask_user null | jq -c '.question = null')" > "$f"
+  assert_contains "$(cc_result_problem "$f" review)" "question"
+  printf '%s\n' "$(call_result done null)" > "$f"
+  assert_contains "$(cc_result_problem "$f" plan)" "plan"
+  printf 'not json\n' > "$f"
+  why=$(cc_result_problem "$f" plan); assert_eq "$?" "1"
+  assert_contains "$why" "JSON"; assert_not_contains "$why" "not json"
+  printf '%s\n' "$(call_result plan 1 "$plan1")" > "$f"
+  why=$(cc_result_problem "$f" plan); assert_eq "$?" "0"; assert_eq "$why" ""
+  return 0
+}

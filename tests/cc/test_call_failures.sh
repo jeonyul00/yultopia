@@ -37,6 +37,15 @@ cf_result() {
     question: (if $v == "ask_user" then "질문" else null end)
   }'
 }
+# cf_want_format_retry <kind> [결과 파일 내용] : 그 결과(기본 "not json")를 받았을 때 감독 프로세스가 보낼 형식 재요청
+#   프롬프트를 $TMP/want-retry.md 에 만든다 (Codex 리뷰 4: 무엇이 틀렸는지 이유를 넣는다)
+cf_want_format_retry() {
+  ( . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/render.sh"; . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
+    printf '%s\n' "${2:-not json}" > "$TMP/bad-result.json"
+    CC_T_REASON=$(cc_result_problem "$TMP/bad-result.json" "$1"); [ -n "$CC_T_REASON" ] || exit 1
+    export CC_T_REASON
+    cc_render "$TPL_DIR/pm-format-retry.md" "$TMP/want-retry.md" )
+}
 cf_assert_failed_state() {   # <status> : 실패로 끝난 호출의 공통 상태
   assert_eq "$(cat "$CALL1/status")" "$1"
   assert_eq "$(state .running)" "null"
@@ -133,7 +142,7 @@ test_invalid_json_requests_format_once() {
   want=$(printf '%s\n' exec resume --json -c 'sandbox_mode="read-only"' --output-schema "$CF_SCHEMA" \
     -o "$CALL1/result.json" fake-thread-1 -)
   assert_eq "$(cat "$FAKE_CODEX_LOG/2.argv")" "$want"
-  cmp -s "$FAKE_CODEX_LOG/2.stdin" "$TPL_DIR/pm-format-retry.md" || _fail "2회차 stdin 이 pm-format-retry.md 와 다름"
+  cf_want_format_retry plan && cmp -s "$FAKE_CODEX_LOG/2.stdin" "$TMP/want-retry.md" || _fail "2회차 stdin 이 이유를 넣은 pm-format-retry.md 와 다름"
   assert_not_contains "$(cat "$FAKE_CODEX_LOG/2.stdin")" "{{"
   assert_eq "$(state .calls_total)" "2"
   assert_eq "$(state .phase)" "working"; assert_eq "$(state .milestone)" "1"
@@ -162,7 +171,7 @@ test_format_retry_of_message_resumes_known_session() {
   assert_eq "$(cf_invocations)" "3"
   assert_eq "$(sed -n 2p "$FAKE_CODEX_LOG/3.argv")" "resume"
   assert_contains "$(cat "$FAKE_CODEX_LOG/3.argv")" "fake-thread-1"
-  cmp -s "$FAKE_CODEX_LOG/3.stdin" "$TPL_DIR/pm-format-retry.md" || _fail "3회차 stdin 이 pm-format-retry.md 와 다름"
+  cf_want_format_retry message && cmp -s "$FAKE_CODEX_LOG/3.stdin" "$TMP/want-retry.md" || _fail "3회차 stdin 이 이유를 넣은 pm-format-retry.md 와 다름"
   assert_eq "$(state .calls_total)" "3"
 }
 test_invalid_json_without_session_is_not_retried() {
@@ -534,4 +543,159 @@ test_call_refuses_symlinked_call_dir() {
   assert_file_exists "$TMP/elsewhere/keep.txt"
   [ -L "$ACTIVE/calls/1" ] || _fail "심볼릭 링크가 사라짐"
   assert_eq "$(state .calls_total)" "0"; assert_eq "$(cf_invocations)" "0"
+}
+
+# ---- Codex 리뷰 4 (R30): 스키마에는 맞지만 절차가 쓸 수 없는 결과는 이유를 알려 한 번 다시 받는다 ----
+test_unusable_plan_result_gets_one_retry_that_names_the_problem() {
+  FAKE_CODEX_SEQ=ok_unusable,ok; start_task
+  run_cc call plan; assert_code 0
+  wait_until_status_file 1 || _fail "status 파일이 생기지 않음"
+  assert_eq "$(cat "$CALL1/status")" "ok"
+  assert_eq "$(cf_invocations)" "2"
+  assert_eq "$(sed -n 2p "$FAKE_CODEX_LOG/2.argv")" "resume"
+  retry=$(cat "$FAKE_CODEX_LOG/2.stdin")
+  assert_contains "$retry" "마일스톤"
+  assert_contains "$retry" "JSON"
+  assert_not_contains "$retry" "{{"
+  unusable='{"verdict":"plan","summary":"빈 계획","plan":{"overview":"o","milestones":[]},"milestone":null,"instruction":null,"findings":[],"question":null}'
+  cf_want_format_retry plan "$unusable" && cmp -s "$FAKE_CODEX_LOG/2.stdin" "$TMP/want-retry.md" || _fail "형식 재요청 프롬프트에 이유가 들어가지 않음"
+  assert_eq "$(state .last_call.verdict)" "plan"
+  assert_eq "$(state .phase)" "working"; assert_eq "$(state .milestone)" "1"
+  assert_eq "$(state .milestones_total)" "2"
+}
+test_plan_call_answered_with_done_ends_as_invalid_not_done() {
+  FAKE_CODEX_RESULT=$(cf_result done null); start_task
+  run_cc call plan; assert_code 0
+  wait_until_status_file 1 || _fail "status 파일이 생기지 않음"
+  cf_assert_failed_state invalid_json
+  assert_eq "$(cf_invocations)" "2"
+  assert_contains "$(state .last_call.message)" "형식"
+  assert_contains "$(state .last_call.message)" "plan"
+  assert_eq "$(cf_lines "$(state .last_call.message)")" "1"
+  assert_eq "$(state .milestone)" "null"
+}
+test_review_ask_user_without_question_is_not_accepted() {
+  start_task
+  run_cc call plan; wait_until_status_file 1 || _fail "계획 호출이 끝나지 않음"
+  printf '%s' "$REVIEW_REPORT" > "$(cc_path report)"
+  FAKE_CODEX_RESULT=$(cf_result ask_user null | jq -c '.question = null')
+  run_cc call review; assert_code 0
+  wait_until_status_file 2 || _fail "status 파일이 생기지 않음"
+  assert_eq "$(cat "$ACTIVE/calls/2/status")" "invalid_json"
+  assert_eq "$(state .last_call.status)" "invalid_json"
+  assert_eq "$(state .phase)" "failed"
+  assert_contains "$(cat "$FAKE_CODEX_LOG/3.stdin")" "question"
+  assert_eq "$(state .milestone)" "1"
+}
+
+# ---- Codex 리뷰 1 (R30): 종료를 확인하지 못하면 끝 상태는 기록하되 running(프로세스 기록)은 지우지 않는다 ----
+# 가짜 ps: 전체 목록(-A)만 실패 → 감독 프로세스가 자기 그룹을 정리하지 못한다 (codex 하나만 신원 확인 후 끝낸다)
+cf_fake_ps_fail_list() {
+  mkdir -p "$TMP/bin"
+  printf '#!/bin/sh\ncase " $* " in *" -A "*) exit 1 ;; esac\nexec /bin/ps "$@"\n' > "$TMP/bin/ps"
+  chmod +x "$TMP/bin/ps"
+}
+test_timeout_keeps_process_record_when_group_cleanup_is_unconfirmed() {
+  FAKE_CODEX_SEQ=hang; CC_CALL_TIMEOUT_SECS=2; CC_ORPHAN_GRACE_SECS=1; start_task
+  cf_fake_ps_fail_list
+  PATH="$TMP/bin:$PATH" run_cc call plan; assert_code 0
+  cf_until 5 cf_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  pg=$(state .running.pgid); cx=$(state .running.codex_pid)
+  wait_until_status_file 1 20 || _fail "status 파일이 생기지 않음"
+  assert_eq "$(cat "$CALL1/status")" "timeout"
+  # 끝 상태(wait 가 돌려줄 결과)는 기록한다
+  assert_eq "$(state .last_call.status)" "timeout"; assert_eq "$(state .last_call.call_id)" "1"
+  assert_eq "$(state .phase)" "failed"
+  assert_contains "$(state .last_call.message)" "시간 초과"
+  assert_contains "$(state .last_call.message)" "ps -o pid,command -g $pg"
+  assert_eq "$(cf_lines "$(state .last_call.message)")" "1"
+  # 프로세스 기록은 남긴다
+  assert_eq "$(state .running.call_id)" "1"; assert_eq "$(state .running.pgid)" "$pg"
+  assert_eq "$(state .running.codex_pid)" "$cx"
+  assert_eq "$(state .running.stop_failed)" "true"
+  # 감독 프로세스는 끝나지만, 확인할 수 없는 프로세스(가짜 codex 의 자식)가 그룹에 남는다
+  cf_until 8 cf_pid_gone "$pg" || _fail "감독 프로세스가 끝나지 않음"
+  pgrep -f -- "fake-codex-hang:$FAKE_CODEX_LOG" >/dev/null || _fail "남은 자식이 없음 (테스트 전제 깨짐)"
+  # wait 는 기다리지 않고 기록된 결과를 한 줄로 돌려준다
+  t0=$SECONDS
+  run_cc wait --max 10; assert_code 3
+  [ $((SECONDS - t0)) -lt 5 ] || _fail "wait 가 끝난 호출을 계속 기다림"
+  assert_eq "$(cf_lines "$OUT")" "1"; assert_eq "$OUT" "$(state .last_call.message)"
+  # 새 호출·버리기·마무리는 거부하고, 고아 확인·훅은 남은 프로세스를 계속 알린다 (아무것도 죽이지 않음)
+  run_cc call plan; assert_code 6
+  assert_eq "$(cf_lines "$OUT")" "1"; assert_contains "$OUT" "ps -o pid,command -g $pg"
+  run_cc discard; assert_code 6; assert_contains "$OUT" "프로세스 그룹 $pg"
+  run_cc finish; assert_code 6
+  assert_file_exists "$ACTIVE/state.json"
+  sleep 2.2
+  run_cc check-orphan; assert_code 10; assert_contains "$OUT" "프로세스 그룹 $pg"
+  ctx=$(printf '{"cwd":"%s"}' "$PWD" | bash "$HOOK" prompt-submit 2>/dev/null)
+  assert_contains "$ctx" "ps -o pid,command -g $pg"
+  pgrep -f -- "fake-codex-hang:$FAKE_CODEX_LOG" >/dev/null || _fail "확인되지 않은 프로세스를 죽임"
+  assert_eq "$(state .running.stop_failed)" "true"
+  # 남은 것이 정말 사라지면 기록만 정리한다: 이미 기록한 끝 상태(timeout)는 그대로 둔다
+  pkill -KILL -f -- "fake-codex-hang:$FAKE_CODEX_LOG"
+  cf_until 3 cf_group_gone "$pg" || _fail "그룹이 끝나지 않음"
+  run_cc check-orphan; assert_code 0
+  assert_eq "$(state .running)" "null"
+  assert_eq "$(state .last_call.status)" "timeout"; assert_eq "$(state .phase)" "failed"
+  assert_eq "$(cat "$CALL1/status")" "timeout"
+  run_cc call plan; assert_code 0
+  wait_until_status_file 2 || _fail "다음 호출이 끝나지 않음"
+}
+# 감독 프로세스 대역(이 테스트 셸)으로 _cc_sup_main 을 돌리되, 그룹 정리 결과만 CF_STOP_RC 로 바꾼다.
+#   대역은 실제로 남은 가짜 codex 를 끝내 테스트가 프로세스를 남기지 않게 한다.
+cf_sup_standin_run() {   # <stop rc> <timeout|normal>
+  CF_STOP_RC=$1
+  _cc_sup_stop_group() {
+    pkill -KILL -f -- "fake-codex-hang:$FAKE_CODEX_LOG" 2>/dev/null
+    [ -n "${1:-}" ] && kill -KILL "$1" 2>/dev/null
+    return "$CF_STOP_RC"
+  }
+  set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $$, supervisor_identity: \"x|y\",
+    codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
+  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_CLAIMED=1
+  _CC_SUP_DONE=0; _CC_SUP_SIGNAL=""; _CC_SUP_CODEX_PID=""; _CC_SUP_CODEX_IDENT=""; _CC_SUP_FINAL=""
+  _CC_SUP_CODEX_RECORDED=0; _CC_SUP_ATTEMPT=1; _CC_SUP_ATTEMPT_SECS=0; _CC_SUP_T0=""; _CC_SUP_TIMED_OUT=0
+  _CC_SUP_REC=""; _CC_SUP_NO_START=0
+  _CC_SUP_RUNNING='{"call_id":1,"kind":"plan"}'
+  mkdir -p "$_CC_SUP_DIR"; printf '프롬프트\n' > "$_CC_SUP_DIR/prompt.md"
+  _cc_sup_init_config
+  _cc_sup_main >> "$TMP/sup-$2-$1.log" 2>&1
+}
+test_supervisor_keeps_process_record_when_stop_is_not_confirmed() {
+  for rc in 2 3; do
+    for how in timeout normal; do
+      (
+        FAKE_CODEX_LOG="$TMP/fc-$how-$rc"
+        if [ "$how" = timeout ]; then FAKE_CODEX_SEQ=hang; CC_CALL_TIMEOUT_SECS=1; else FAKE_CODEX_SEQ=ok; fi
+        start_task "sup-$how-$rc"; cf_source_call
+        cf_sup_standin_run "$rc" "$how"
+        want=ok; [ "$how" = timeout ] && want=timeout
+        assert_eq "$(cat "$CALL1/status" 2>/dev/null)" "$want" "$how/$rc status 파일"
+        assert_eq "$(state .last_call.status)" "$want" "$how/$rc last_call"
+        assert_eq "$(state .last_call.call_id)" "1"
+        assert_contains "$(state .last_call.message)" "ps -o pid,command -g $$"
+        assert_eq "$(cf_lines "$(state .last_call.message)")" "1"
+        assert_eq "$(state .running.call_id)" "1" "$how/$rc running 이 지워짐"
+        assert_eq "$(state .running.pgid)" "$$"
+        assert_eq "$(state .running.stop_failed)" "true"
+        if [ "$how" = normal ]; then
+          assert_eq "$(state .last_call.verdict)" "plan"
+          assert_eq "$(state .phase)" "working"; assert_eq "$(state .milestone)" "1"
+        else
+          assert_eq "$(state .phase)" "failed"
+        fi
+        grep -q '반영하지 못함' "$TMP/sup-$how-$rc.log" && _fail "$how/$rc: 결과 반영을 되풀이함"
+        # wait 는 기록된 결과를 곧바로 돌려준다
+        if [ "$how" = normal ]; then run_cc wait --max 5; assert_code 0; assert_eq "$(jq -r .verdict <<<"$OUT")" "plan"
+        else run_cc wait --max 5; assert_code 3; assert_contains "$OUT" "시간 초과"; fi
+        # 이 대역 기록은 확인상 끝난 것(dead)이다: 정리할 때 running 만 지우고 끝 상태는 그대로 둔다
+        run_cc check-orphan; assert_code 0
+        assert_eq "$(state .running)" "null"
+        assert_eq "$(state .last_call.status)" "$want" "$how/$rc 정리 뒤 끝 상태"
+      )
+    done
+  done
+  return 0
 }

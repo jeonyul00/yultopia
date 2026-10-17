@@ -31,8 +31,8 @@ test_render_empty_value_counts_as_set() {
 }
 test_render_all_templates() {
   CC_T_BRIEF=b CC_T_REPORT=r CC_T_MILESTONE=2 CC_T_MILESTONE_BASE_TREE=aaa CC_T_REVIEW_TREE=bbb \
-    CC_T_TASK_BASE_TREE=ccc CC_T_VERIFY_DIR=/v CC_T_MESSAGE=m CC_T_PHASE=done
-  export CC_T_BRIEF CC_T_REPORT CC_T_MILESTONE CC_T_MILESTONE_BASE_TREE CC_T_REVIEW_TREE CC_T_TASK_BASE_TREE CC_T_VERIFY_DIR CC_T_MESSAGE CC_T_PHASE
+    CC_T_TASK_BASE_TREE=ccc CC_T_VERIFY_DIR=/v CC_T_MESSAGE=m CC_T_PHASE=done CC_T_REASON=why
+  export CC_T_BRIEF CC_T_REPORT CC_T_MILESTONE CC_T_MILESTONE_BASE_TREE CC_T_REVIEW_TREE CC_T_TASK_BASE_TREE CC_T_VERIFY_DIR CC_T_MESSAGE CC_T_PHASE CC_T_REASON
   for t in pm-plan pm-review pm-message pm-format-retry; do
     cc_render "$TPL_DIR/$t.md" "$TMP/o-$t"; assert_eq "$?" 0 "$t"
     assert_not_contains "$(cat "$TMP/o-$t")" "{{"
@@ -68,4 +68,8 @@ test_prompts_state_pm_rules() {
   assert_contains "$m" "추가 수정 요구"
   assert_contains "$m" "새 마일스톤"
   assert_contains "$(cat "$TPL_DIR/pm-format-retry.md")" "JSON"
+  # Codex 리뷰 4: 형식 재요청은 무엇이 틀렸는지(이유)를 알려 내용도 고치게 한다
+  fr=$(cat "$TPL_DIR/pm-format-retry.md")
+  assert_contains "$fr" "{{REASON}}"
+  assert_contains "$fr" "채우거나 고쳐서"
 }

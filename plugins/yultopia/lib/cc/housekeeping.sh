@@ -7,6 +7,8 @@
 #   "확실히 안 돎" 은 none·dead 뿐이다. uncertain 을 근거로 지우거나 죽이지 않는다 (R8: 2 는 상태 삭제의 근거가 아님).
 #   dead 를 확인하면 그 자리에서 state 를 정리한다: running=null, last_call.status=interrupted, phase=interrupted,
 #   status 파일 == state (wait 가 기록 없이 죽은 호출을 정리할 때와 같은 값·같은 도우미).
+#   running.stop_failed 기록(끝 상태는 기록됐지만 종료를 확인하지 못해 남긴 기록, R30)도 똑같이 판단한다. 살아 있거나
+#   남은 그룹이면 고아로 알리고 지우지 않는다. dead 가 되면 running 만 지운다 (이미 기록된 끝 상태는 그대로).
 #
 # 고아 (addendum C): 다음을 모두 만족
 #   1) alive, 또는 uncertain 이지만 "감독 프로세스·codex 는 확실히 없는데 그룹에 무언가 남음"(남은 그룹, addendum D)
@@ -20,6 +22,8 @@
 # 삭제 (cleanup-stale, discard, finish): 확인된 <git-dir>/yultopia-cc/active 정확한 경로에만 (cc_delete_active).
 #   state 잠금을 쥔 채 다시 읽고 다시 판단한 뒤 지운다 (그 사이 다른 call 이 시작했으면 지우지 않는다).
 #   잠금 폴더는 active 안에 있어 함께 지워진다. 그 뒤 잠금을 기다리던 쪽은 잠금을 못 잡고 실패한다 (아무것도 쓰지 않음).
+#   state 를 읽을 수 없거나 running 이 깨진 기록은 discard·finish 만, 명령줄에 이 active 경로를 가진 프로세스(codex·감독
+#   프로세스)가 없음을 ps 로 확인한 뒤에 지운다 (R30). 있거나 ps 가 실패하면 지우지 않고(6) 그 PID·그룹을 알린다. 신호는 없다.
 #
 # 전역 (이 파일 안에서만): _CC_HK_ST(읽은 state JSON), _CC_HK_RS(none|alive|dead|uncertain|unreadable|fresh),
 #   _CC_HK_LEFTOVER(1 = 남은 그룹), _CC_HK_PG(기록된 pgid), _CC_HK_ID(running.call_id), _CC_HK_LINE(알릴 한 줄),
@@ -52,7 +56,8 @@ _cc_hk_classify() {
   _cc_call_liveness "$_CC_HK_ST"
   _CC_HK_RS=$_CC_LIVENESS; _CC_HK_LEFTOVER=$_CC_LIVENESS_LEFTOVER; _CC_HK_PG=$_CC_LIVENESS_PGID
   _CC_HK_ID=$(_cc_jq_get "$_CC_HK_ST" 'if (.running | type) == "object" then (.running.call_id // empty | tostring) else empty end')
-  # running 기록이 온전하지 않으면 (_cc_running_wellformed) 읽을 수 없는 기록 (discard·finish 만 이 근거로 지운다)
+  # running 기록이 온전하지 않으면 (_cc_running_wellformed) 읽을 수 없는 기록 (discard·finish 만, 이 작업의 프로세스가
+  # 없음을 확인한 뒤에 지운다: _cc_hk_delete_if_idle, R30)
   _cc_running_wellformed "$_CC_HK_ST" || _CC_HK_MALFORMED=1
   return 0
 }
@@ -169,8 +174,9 @@ _cc_hk_kill_orphan() {
         _CC_HK_LINE="[cc] Codex 호출 $id 은(는) 종료하기 전에 이미 끝나 있었습니다 ($final)"
       fi ;;
     3)
+      # 종료를 확인하지 못했다: 끝 상태는 기록하되 프로세스 기록(running)은 남겨 계속 추적한다 (R30)
       _cc_wait_settle "$id" interrupted \
-        "[cc] 남아 있던 Codex를 종료하려 했지만 일부 프로세스가 KILL 뒤에도 남아 있습니다 (호출 $id)." >/dev/null
+        "[cc] 남아 있던 Codex를 종료하려 했지만 일부 프로세스가 KILL 뒤에도 남아 있습니다 (호출 $id)." keep >/dev/null
       _CC_HK_LINE="[cc] 남아 있던 Codex를 종료하려 했지만 일부 프로세스가 KILL 뒤에도 남아 있습니다 (호출 $id)" ;;
     *)
       _CC_HK_LINE="[cc] 기다리는 대기 명령 없이 Codex가 실행 중이지만 안전하게 종료할 수 있는지 확인하지 못해 종료하지 않았습니다 (호출 $id)" ;;
@@ -224,10 +230,76 @@ _cc_hk_activity_age() {
 
 _cc_hk_stale_limit() { printf '%s\n' $(( $(_cc_sup_uint "${CC_STALE_DAYS:-}" 14) * 86400 )); }
 
+# _cc_hk_task_procs : 이 작업의 Codex·감독 프로세스로 보이는 프로세스를 찾는다. 아무 신호도 보내지 않는다 (R30).
+#   state 를 읽을 수 없거나 running 이 깨져 실행 기록으로는 Codex 가 도는지 알 수 없을 때, 버리기·마무리 전에만 쓴다.
+#   명령줄에 이 저장소의 active 경로가 (바로 뒤에 "/"·공백·끝이 오는 꼴로) 들어 있는 프로세스를 찾는다:
+#   codex 는 -o <active>/calls/<n>/result.json, 감독 프로세스는 _supervise <n> <active> 로 실행된다 (call.sh).
+#   macOS 의 LC_ALL=C ps 는 비ASCII·제어 문자를 vis(3) 꼴(한글 바이트 → M-m, M^U … / 탭·줄바꿈 → \011, \012)로 보여
+#   주므로, 경로를 같은 꼴로 바꾼 것과 원래 경로 둘 다로 찾는다. 경로는 환경변수로 넘긴다 (찾는 perl 자신의 명령줄에
+#   나오지 않도록). 이 판단은 지울지 말지에만 쓴다: 찾은 프로세스가 우리 것인지 확인하지 않으므로 죽이지 않는다.
+#   0 = 찾음: _CC_HK_PROCS = "PID 123 (그룹 120), …" (최대 5개, 나머지는 "외 N개"), _CC_HK_PROC_PGS = 그룹 번호들
+#   1 = 없음 / 2 = 판단 불가 (ps 실패, 목록이 비었거나 이상함)
+_cc_hk_task_procs() {
+  local a out rc pid pg n=0 more=0
+  _CC_HK_PROCS=""; _CC_HK_PROC_PGS=""
+  a=$(cc_active_dir) || return 2
+  out=$(CC_HK_SCAN_PATH="$a" LC_ALL=C perl -e '
+    my $a = $ENV{CC_HK_SCAN_PATH};
+    exit 2 unless defined $a && length $a;
+    sub vis {
+      my $o = "";
+      for my $c (unpack("C*", $_[0])) {
+        if ($c >= 0x20 && $c < 0x7f) { $o .= chr($c); next }
+        if ($c == 0x09 || $c == 0x0a || ($c & 0x7f) == 0x20) { $o .= sprintf("\\%03o", $c); next }
+        my $m = ($c & 0x80) ? "M" : "";
+        $c &= 0x7f;
+        $o .= ($c < 0x20 || $c == 0x7f) ? $m . "^" . ($c == 0x7f ? "?" : chr($c + 64)) : $m . "-" . chr($c);
+      }
+      return $o;
+    }
+    my @pats = ($a);
+    my $v = vis($a);
+    push @pats, $v if $v ne $a;
+    open(my $fh, "-|", "ps", "-A", "-ww", "-o", "pid=,pgid=,command=") or exit 2;
+    my ($seen, @hits) = (0);
+    while (my $l = <$fh>) {
+      chomp $l;
+      my ($pid, $pg, $cmd) = $l =~ /^\s*([0-9]+)\s+([0-9]+)\s(.*)$/ or next;
+      $seen++;
+      next if $pid == $$;
+      for my $p (@pats) { if ($cmd =~ /\Q$p\E(?:[\/ ]|$)/) { push @hits, "$pid $pg"; last } }
+    }
+    close $fh or exit 2;
+    exit 2 unless $seen;
+    print "$_\n" for @hits;
+    exit(@hits ? 0 : 1);
+  ' 2>/dev/null)
+  rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+  while read -r pid pg; do
+    _cc_proc_is_pid "$pid" && _cc_proc_is_pid "$pg" || continue
+    if [ "$n" -lt 5 ]; then _CC_HK_PROCS="${_CC_HK_PROCS:+$_CC_HK_PROCS, }PID $pid (그룹 $pg)"; else more=$((more + 1)); fi
+    n=$((n + 1))
+    case " $_CC_HK_PROC_PGS " in *" $pg "*) ;; *) _CC_HK_PROC_PGS="${_CC_HK_PROC_PGS:+$_CC_HK_PROC_PGS }$pg" ;; esac
+  done <<EOF
+$out
+EOF
+  [ -n "$_CC_HK_PROCS" ] || return 2
+  [ "$more" -gt 0 ] && _CC_HK_PROCS="$_CC_HK_PROCS 외 ${more}개"
+  return 0
+}
+
 # _cc_hk_delete_if_idle <stale_limit_secs | ""> : state 잠금을 쥔 채 다시 확인하고 none·dead 일 때만 active 를 지운다.
 #   stale_limit 을 주면(cleanup-stale) last_activity_at 이 아직 그보다 오래됐고 state 를 읽을 수 있을 때만 지운다.
-#   주지 않으면(discard·finish: 사용자가 직접 고른 삭제) state 를 읽을 수 없어도 지운다 (지킬 실행 기록이 없다).
-#   0 지움 / 1 지우지 않음 (_CC_HK_RS = alive | uncertain | unreadable | fresh) / 2 잠금 실패 / 3 경로 비정상·삭제 실패
+#   주지 않으면(discard·finish: 사용자가 직접 고른 삭제) state 를 읽을 수 없거나 running 이 깨진 기록도, 이 작업의
+#   프로세스가 없음을 확인했을 때만 지운다 (_cc_hk_task_procs. R30 이 R22 를 대체: 실행 기록 없이 지우면 돌고 있는
+#   Codex 의 유일한 추적 기록을 잃는다). 찾았거나 확인하지 못하면 지우지 않는다. 아무 신호도 보내지 않는다.
+#   0 지움 / 1 지우지 않음 (_CC_HK_RS = alive | uncertain | unreadable | fresh | procs | procs_unknown)
+#   2 잠금 실패 / 3 경로 비정상·삭제 실패
 _cc_hk_delete_if_idle() {
   local limit="$1" age rc=1
   cc_state_lock || return 2
@@ -240,10 +312,18 @@ _cc_hk_delete_if_idle() {
     fi
   fi
   if _cc_hk_classify || [ -z "$limit" ]; then
-    # 사용자가 직접 고른 삭제(limit 없음)는 running 이 형식이 틀린 기록도 지운다: 지킬 실행 기록을 읽을 수 없어
-    # 거부해도 영영 풀리지 않는다. 자동 정리(limit 있음)는 이 경우 지우지 않는다.
+    # 사용자가 직접 고른 삭제(limit 없음)는 running 이 형식이 틀린 기록도 읽을 수 없는 기록처럼 다룬다: 실행 기록으로는
+    # 판단할 수 없으므로 아래 프로세스 확인으로 정한다. 자동 정리(limit 있음)는 이 경우 지우지 않는다.
     if [ "$_CC_HK_RS" = uncertain ] && [ -z "$limit" ] && [ "$_CC_HK_MALFORMED" = 1 ]; then
       _CC_HK_RS=unreadable
+    fi
+    if [ "$_CC_HK_RS" = unreadable ] && [ -z "$limit" ]; then
+      _cc_hk_task_procs
+      case $? in
+        1) ;;                            # 이 작업의 프로세스 없음 → 지운다
+        0) _CC_HK_RS=procs ;;            # 있음 → 지우지 않는다
+        *) _CC_HK_RS=procs_unknown ;;    # 확인 못 함 → 지우지 않는다
+      esac
     fi
     case "$_CC_HK_RS" in
       none|dead|unreadable)
@@ -312,7 +392,7 @@ cc_cmd_cleanup_stale() {
 # _cc_hk_remove_active <완료 줄> : Codex 가 돌 수 있으면(alive·uncertain) 6 과 한 줄, 아니면 active 를 지운다
 #   (R8: 판단할 수 없음은 삭제의 근거가 아니다. 남은 그룹이면 PGID 와 확인 방법을 알린다)
 _cc_hk_remove_active() {
-  local done_line="$1" r
+  local done_line="$1" r g cmds=""
   cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다."; return 0; }
   cc_active_path_safe || { cc_line "[cc] 상태 폴더 경로가 비정상이라 삭제하지 않았습니다."; return 1; }
   _cc_hk_delete_if_idle ""; r=$?
@@ -321,13 +401,22 @@ _cc_hk_remove_active() {
     2) cc_line "[cc] 상태 파일이 잠겨 있어 지우지 못했습니다. 잠시 뒤 다시 시도하세요."; return 1 ;;
     3) cc_line "[cc] 상태 폴더를 지우지 못했습니다."; return 1 ;;
   esac
-  if [ "$_CC_HK_RS" = alive ]; then
-    cc_line "[cc] Codex가 실행 중입니다. 먼저 종료하세요"
-  elif [ "$_CC_HK_LEFTOVER" = 1 ]; then
-    cc_line "$(_cc_hk_leftover_line "[cc] 지우지 않았습니다: ")"
-  else
-    cc_line "[cc] Codex가 실행 중인지 확인할 수 없어 지우지 않았습니다. 잠시 뒤 다시 시도하세요"
-  fi
+  case "$_CC_HK_RS" in
+    alive)
+      cc_line "[cc] Codex가 실행 중입니다. 먼저 종료하세요" ;;
+    procs)
+      # 기록을 읽을 수 없어 우리 것인지 확인할 수 없다: 종료하지 않고 사용자가 직접 볼 수 있게 PID·그룹·확인 명령을 알린다
+      for g in $_CC_HK_PROC_PGS; do cmds="${cmds:+$cmds, }ps -o pid,command -g $g"; done
+      cc_line "[cc] 상태 기록을 읽을 수 없는데 이 작업의 Codex 프로세스로 보이는 것이 남아 있어 지우지 않았습니다: $_CC_HK_PROCS. /cc 는 이것을 자동으로 종료하지 않습니다. 확인: $cmds" ;;
+    procs_unknown)
+      cc_line "[cc] 상태 기록을 읽을 수 없고 이 작업의 Codex 프로세스가 남아 있는지 확인하지 못해 지우지 않았습니다. 잠시 뒤 다시 시도하세요" ;;
+    *)
+      if [ "$_CC_HK_LEFTOVER" = 1 ]; then
+        cc_line "$(_cc_hk_leftover_line "[cc] 지우지 않았습니다: ")"
+      else
+        cc_line "[cc] Codex가 실행 중인지 확인할 수 없어 지우지 않았습니다. 잠시 뒤 다시 시도하세요"
+      fi ;;
+  esac
   return 6
 }
 

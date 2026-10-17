@@ -28,6 +28,7 @@
 #   ok_leave_child  같은 그룹에 자식(sleep 1000)을 남겨 두고 ok 로 끝남. 자식 PID 는 <n>.leftover
 #   slow          FAKE_CODEX_DELAY 초 동안 1초마다 이벤트를 쓰다가 ok
 #   slow_invalid_json  slow 와 같지만 끝에 -o 에 "not json" 기록 (invalid_json 처럼)
+#   ok_unusable   스키마에는 맞지만 절차가 쓸 수 없는 결과 (verdict plan, 마일스톤 없음, 지시 null) 를 쓰고 exit 0
 
 log="${FAKE_CODEX_LOG:-${TMP:-/tmp}/fake-codex.log}"
 mkdir -p "$log" || exit 70
@@ -87,6 +88,10 @@ case "$mode" in
   invalid_json)
     thread_started; turn_completed
     write_out "not json"
+    exit 0 ;;
+  ok_unusable)
+    thread_started; turn_completed
+    write_out '{"verdict":"plan","summary":"빈 계획","plan":{"overview":"o","milestones":[]},"milestone":null,"instruction":null,"findings":[],"question":null}'
     exit 0 ;;
   invalid_json_no_thread)
     printf '%s\n' '{"type":"turn.started"}'; turn_completed

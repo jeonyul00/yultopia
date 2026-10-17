@@ -146,3 +146,19 @@ test_skill_extra_work_after_done_is_new_milestone() {
   assert_contains "$s11" "새 마일스톤"
   assert_contains "$s11" "지금 번호 + 1"
 }
+# ---- Codex 리뷰 (R30) ----
+test_skill_covers_unconfirmed_stop_broken_discard_and_plan_question() {
+  # 1: 종료를 확인하지 못한 이전 호출 때문에 call 이 거부되면 알리고 멈춘다 (wait 줄의 안내도 전한다)
+  s7=$(skill_section 7)
+  assert_contains "$s7" "\"끝났는지 확인하지 못해\""
+  assert_contains "$s7" "끝났는지 확인하지 못했습니다"
+  assert_contains "$s7" "ps -o pid,command -g"
+  # 3: 깨진 기록 버리기는 이 작업의 프로세스가 없을 때만 (R22 대체)
+  s2=$(skill_section 2)
+  assert_contains "$s2" "이 작업의 Codex 프로세스가 남아 있지 않은지"
+  assert_contains "$s2" "확인하지 못하면 지우지 않는다"
+  # 4: 계획 요청의 결과는 plan 또는 ask_user
+  s4=$(skill_section 4)
+  assert_contains "$s4" "\`ask_user\`"
+  assert_contains "$s4" "Codex 질문:"
+}

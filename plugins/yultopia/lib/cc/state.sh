@@ -64,11 +64,32 @@ cc_state_get() {
 #   - owner 가 자기 PID 면 자기 잠금이다 (잡은 직후 신호로 깊이 기록만 잃은 경우). 그대로 잡은 것으로 본다.
 #   - 풀기: owner 가 자기일 때만 다른 이름으로 rename 한 뒤 지운다.
 #   - 같은 셸 안에서는 다시 잡아도 된다(깊이만 센다). 이 값은 export 하지 않으므로 자식 프로세스로 넘어가지 않는다.
+#   - 잠금 자리(state.lock)는 진짜 폴더, 그 안의 owner 는 보통 파일이어야 한다 (lstat 으로 본다. Codex 리뷰 2, R30).
+#     심볼릭 링크 등이면 따라가서 읽거나 그 안의 것을 지우지 않고 곧바로 거부한다 (링크를 따라가면 active 밖의 파일을
+#     지울 수 있었다). 옮긴 자리도 진짜 폴더임을 다시 확인한 뒤에만 그 안의 owner 를 지운다.
 #   PID 는 perl 의 getppid() 로 얻는다. bash 3.2 의 $$ 는 서브셸에서도 바깥 셸 PID 라서 쓸 수 없다.
 : "${CC_STATE_LOCK_WAIT_SECS:=5}"
 _CC_STATE_LOCK_DEPTH=0
 
-# 0 잡음 / 1 시간 안에 못 잡음·오류
+# 두 perl 이 함께 쓰는 owner 읽기: 소유자 PID 문자열 ("" = 잠금·owner 없음 또는 빈 파일),
+#   undef = 잠금 자리가 진짜 폴더가 아니거나 owner 가 보통 파일이 아님 (따라가지 않는다)
+_CC_STATE_OWNER_OF='
+  use Fcntl qw(O_RDONLY O_NOFOLLOW);
+  sub cc_owner_of {
+    my ($d) = @_;
+    my @s = lstat($d);
+    return ($!{ENOENT} ? "" : undef) unless @s;
+    return undef unless -d _;               # lstat 이므로 심볼릭 링크는 폴더가 아니다
+    @s = lstat("$d/owner");
+    return ($!{ENOENT} ? "" : undef) unless @s;
+    return undef unless -f _;
+    sysopen(my $f, "$d/owner", O_RDONLY | O_NOFOLLOW) or return ($!{ENOENT} ? "" : undef);
+    my $p = <$f>; close $f;
+    $p = "" unless defined $p; chomp $p; return $p;
+  }
+'
+
+# 0 잡음 / 1 시간 안에 못 잡음·오류·잠금 자리 비정상(거부)
 cc_state_lock() {
   local a
   if [ "${_CC_STATE_LOCK_DEPTH:-0}" -gt 0 ]; then
@@ -77,14 +98,13 @@ cc_state_lock() {
   fi
   a=$(cc_active_dir) || return 1
   [ -d "$a" ] || return 1
-  perl -MTime::HiRes -MFcntl=:flock -e '
+  perl -MTime::HiRes -MFcntl=:flock -e "$_CC_STATE_OWNER_OF"'
     my ($lock, $wait, $dir) = @ARGV;
     my $me = getppid();
     my $deadline = Time::HiRes::time() + $wait;
-    my $owner_of = sub {
-      open(my $f, "<", "$_[0]/owner") or return "";
-      my $p = <$f>; close $f;
-      $p = "" unless defined $p; chomp $p; return $p;
+    my $abnormal = sub {
+      print STDERR "[cc] state.json 잠금 자리가 진짜 폴더가 아니거나 owner 가 보통 파일이 아니라(심볼릭 링크 등) 잠그지 않았습니다: $lock\n";
+      exit 3;
     };
     while (1) {
       my $tmp = "$lock.tmp.$me.$$." . int(rand(1e9));
@@ -94,7 +114,8 @@ cc_state_lock() {
       if ($ok && rename($tmp, $lock)) { exit 0 }
       unlink "$tmp/owner"; rmdir $tmp;
       exit 1 unless $ok;
-      my $p = $owner_of->($lock);
+      my $p = cc_owner_of($lock);
+      $abnormal->() unless defined $p;
       # 자기 PID 의 잠금: 잡은 직후 신호 처리로 깊이 기록만 잃은 경우다 (살아 있는 PID 는 하나뿐). 그대로 쓴다.
       exit 0 if $p eq $me;
       if ($p =~ /^[1-9][0-9]*$/ && !kill(0, $p) && $!{ESRCH}) {
@@ -106,16 +127,21 @@ cc_state_lock() {
           if (!flock($bf, LOCK_EX | LOCK_NB)) { $may = 0 if $!{EWOULDBLOCK} || $!{EAGAIN} || $!{EINTR} }
         } else { undef $bf }
         my $broke = 0;
-        if ($may && $owner_of->($lock) eq $p) {
+        my $q = $may ? cc_owner_of($lock) : "";
+        $abnormal->() unless defined $q;
+        if ($may && $q eq $p) {
           my $gone = "$lock.stale.$me.$$." . int(rand(1e9));
           if (rename($lock, $gone)) {
-            if ($owner_of->($gone) eq $p) {
+            # 옮긴 자리가 진짜 폴더이고 owner 가 보통 파일일 때만 그 안을 지운다
+            my $g = cc_owner_of($gone);
+            if (defined $g && $g eq $p) {
               unlink "$gone/owner"; rmdir $gone;
               $broke = 1;
             } elsif (!rename($gone, $lock)) {
-              # 살아 있는 잠금을 옮겼는데 되돌릴 자리를 이미 다른 쪽이 잡았다. 지우지 않고 남겨 둔다.
+              # 살아 있는 잠금(또는 비정상 자리)을 옮겼는데 되돌릴 자리를 이미 다른 쪽이 잡았다. 지우지 않고 남겨 둔다.
               print STDERR "[cc] state.json 잠금을 되돌리지 못했습니다: $gone\n";
             }
+            $abnormal->() unless defined $g;
           }
         }
         close $bf if $bf;
@@ -134,17 +160,18 @@ cc_state_unlock() {
   _CC_STATE_LOCK_DEPTH=$((_CC_STATE_LOCK_DEPTH - 1))
   [ "$_CC_STATE_LOCK_DEPTH" -eq 0 ] || return 0
   a=$(cc_active_dir) || return 1
-  perl -e '
+  perl -e "$_CC_STATE_OWNER_OF"'
     my ($lock) = @ARGV;
     my $me = getppid();
-    open(my $f, "<", "$lock/owner") or exit 1;
-    my $p = <$f>; close $f;
-    $p = "" unless defined $p; chomp $p;
-    exit 1 unless $p eq $me;
+    my $p = cc_owner_of($lock);
+    exit 1 unless defined $p && $p eq $me;
     my $gone = "$lock.rel.$me.$$." . int(rand(1e9));
     rename($lock, $gone) or exit 1;
-    unlink "$gone/owner"; rmdir $gone;
-    exit 0;
+    # 옮긴 자리가 여전히 진짜 폴더일 때만 그 안을 지운다. 아니면 되돌리고 아무것도 지우지 않는다.
+    my $g = cc_owner_of($gone);
+    if (defined $g) { unlink "$gone/owner"; rmdir $gone; exit 0 }
+    rename($gone, $lock);
+    exit 1;
   ' -- "$a/state.lock"
 }
 

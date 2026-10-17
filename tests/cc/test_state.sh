@@ -279,3 +279,53 @@ test_state_lock_reclaims_lock_left_by_same_process() {
   assert_eq "$(state .milestone)" "5"
   assert_no_path "$ACTIVE/state.lock"
 }
+
+# ---- Codex 리뷰 2 (R30): state.lock 자리나 그 안의 owner 가 진짜 폴더·보통 파일이 아니면 따라가지 않는다 ----
+#   (링크를 따라 읽고, 옮긴 링크 안의 owner 를 지우면 active 밖의 파일이 지워졌다)
+test_state_lock_never_follows_symlinked_lock_dir() {
+  start_task
+  bash -c 'exit 0' & dead=$!; wait "$dead"
+  mkdir "$TMP/outside"; echo "$dead" > "$TMP/outside/owner"
+  ln -s "$TMP/outside" "$ACTIVE/state.lock"
+  before=$(cat "$ACTIVE/state.json")
+  t0=$(date +%s)
+  run_cc ack-rejects; assert_code 1
+  assert_eq "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')" "1"
+  assert_contains "$OUT" "[cc] "
+  [ $(( $(date +%s) - t0 )) -lt 4 ] || _fail "거부하지 않고 잠금을 기다림"
+  assert_eq "$(cat "$TMP/outside/owner" 2>/dev/null)" "$dead" "active 밖의 owner 파일"
+  [ -L "$ACTIVE/state.lock" ] || _fail "state.lock 링크가 옮겨지거나 지워짐"
+  assert_eq "$(ls -A "$ACTIVE" | grep -c '^state\.lock\.')" "0"
+  assert_eq "$(cat "$ACTIVE/state.json")" "$before"
+}
+test_state_lock_refuses_lock_entry_that_is_not_plain() {
+  start_task
+  bash -c 'exit 0' & dead=$!; wait "$dead"
+  # owner 가 active 밖의 파일을 가리키는 링크: 따라 읽지 않고 잠금을 치우지 않는다
+  mkdir "$ACTIVE/state.lock"; echo "$dead" > "$TMP/outside-owner"
+  ln -s "$TMP/outside-owner" "$ACTIVE/state.lock/owner"
+  CC_STATE_LOCK_WAIT_SECS=1 cc_state_update '.milestone=7' 2>/dev/null && _fail "링크인 owner 를 따라 읽고 잠금을 치움"
+  assert_eq "$(state .milestone)" "null"
+  [ -L "$ACTIVE/state.lock/owner" ] || _fail "owner 링크가 지워짐"
+  assert_eq "$(cat "$TMP/outside-owner")" "$dead"
+  rm -rf "$ACTIVE/state.lock"
+  # 잠금 자리가 보통 파일
+  printf '%s\n' "$dead" > "$ACTIVE/state.lock"
+  CC_STATE_LOCK_WAIT_SECS=1 cc_state_update '.milestone=8' 2>/dev/null && _fail "파일인 잠금 자리를 넘음"
+  assert_eq "$(cat "$ACTIVE/state.lock")" "$dead"
+  assert_eq "$(state .milestone)" "null"
+}
+test_state_unlock_never_follows_symlinked_lock_dir() {
+  start_task
+  (
+    me=$(exec perl -e 'print getppid()')      # 이 셸의 PID (잠금 owner 로 쓰는 값)
+    mkdir "$TMP/outside"; echo "$me" > "$TMP/outside/owner"
+    ln -s "$TMP/outside" "$ACTIVE/state.lock"
+    _CC_STATE_LOCK_DEPTH=1
+    cc_state_unlock 2>/dev/null
+    :
+  )
+  assert_file_exists "$TMP/outside/owner"
+  [ -L "$ACTIVE/state.lock" ] || _fail "state.lock 링크가 옮겨지거나 지워짐"
+  assert_eq "$(ls -A "$ACTIVE" | grep -c '^state\.lock\.')" "0"
+}

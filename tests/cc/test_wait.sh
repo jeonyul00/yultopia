@@ -628,6 +628,7 @@ test_interrupt_gives_codex_three_seconds_to_shut_down() {
 use Time::HiRes qw(sleep);
 $SIG{TERM} = sub { $SIG{TERM} = "IGNORE"; sleep 2; open my $h, ">", "$ENV{WT_STAMP_DIR}/shutdown-done"; close $h; exit 0 };
 $| = 1;
+# TERM 처리기를 건 뒤에야 쓴다: 테스트는 이 줄이 events 에 나온 것을 보고 중단 신호를 보낸다
 print "{\"type\":\"thread.started\",\"thread_id\":\"slow-exit-thread\"}\n";
 sleep 0.1 while 1;
 PL
@@ -636,6 +637,9 @@ PL
   CC_CODEX_BIN="$TMP/slow-exit-codex"; export CC_CODEX_BIN
   start_task; run_cc call plan; assert_code 0
   wt_until 5 wt_codex_recorded || _fail "codex_pid 가 기록되지 않음"
+  # codex_pid 는 exec 직후 기록되지만 perl 이 시작해 TERM 처리기를 걸기까지는 시간이 더 걸릴 수 있다. 그 전에 TERM 이
+  #   오면 대역이 기본 동작으로 바로 죽어 정리 표시가 남지 않는다 (간헐 실패의 원인). 처리기를 건 뒤 쓰는 줄을 기다린다.
+  wt_until 10 grep -q slow-exit-thread "$ACTIVE/calls/1/events.jsonl" || _fail "codex 대역이 TERM 처리기를 걸지 않음"
   pg=$(state .running.pgid)
   wt_start_waiter --max 60
   wt_until 5 wt_waiter_registered || _fail "waiter 가 등록되지 않음"
@@ -647,4 +651,51 @@ PL
   assert_eq "$(cat "$TMP/w.out")" "[cc] 중단됨: Codex 종료"
   wt_group_alive "$pg" && _fail "감독 프로세스 그룹이 남아 있음"
   wt_assert_terminal 1 interrupted interrupted
+}
+
+# ---- Codex 리뷰 1 (R30): 중단 처리에서 KILL 뒤에도 남으면(3) 끝 상태는 기록하되 프로세스 기록은 남긴다 ----
+wt_source_libs() {
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/render.sh"
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/call.sh"
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/wait.sh"
+  . "$CC_REPO_ROOT/plugins/yultopia/lib/cc/housekeeping.sh"
+}
+test_interrupt_keeps_process_record_when_kill_is_not_confirmed() {
+  for path in fast slow; do
+    (
+      start_task "int-$path"; wt_source_libs
+      wt_fake_running "$(wt_iso_ago 5)" "$(wt_iso_ago 5)" || _fail "대역 준비 실패"
+      pg=$FAKE_SUP_PG
+      # 테스트 전용 대역: 검증된 종료가 "KILL 뒤에도 남음"(3) 으로 끝난 상황 (실제로는 아무 신호도 보내지 않는다)
+      cc_kill_group_verified() { return 3; }
+      _cc_wait_stop_group() { return 3; }
+      _CC_WAIT_ACTIVE="$ACTIVE"; _CC_WAIT_ID=1; _CC_WAIT_C_PG=""; _CC_WAIT_C_SID=""
+      [ "$path" = fast ] && _cc_wait_running_cache "$(cat "$ACTIVE/state.json")"
+      _cc_wait_interrupt
+      assert_eq "$_CC_WAIT_CODE" "130"
+      assert_contains "$_CC_WAIT_LINE" "KILL 뒤에도"
+      assert_eq "$(state .last_call.status)" "interrupted" "$path"
+      assert_eq "$(state .phase)" "interrupted"
+      assert_eq "$(cat "$ACTIVE/calls/1/status" 2>/dev/null)" "interrupted"
+      assert_eq "$(state .running.call_id)" "1" "$path: running 이 지워짐"
+      assert_eq "$(state .running.pgid)" "$pg"
+      assert_eq "$(state .running.stop_failed)" "true"
+      kill -0 "$pg" 2>/dev/null || _fail "대역이 죽음 (테스트 전제 깨짐)"
+      # 다음 wait 는 기다리지 않고 기록된 결과를 돌려준다. 새 호출·버리기는 거부한다
+      t0=$SECONDS
+      run_cc wait --max 10; assert_code 3
+      [ $((SECONDS - t0)) -lt 5 ] || _fail "wait 가 끝난 호출을 계속 기다림"
+      assert_eq "$(wt_lines "$OUT")" "1"; assert_contains "$OUT" "KILL 뒤에도"
+      run_cc call plan; assert_code 6; assert_contains "$OUT" "ps -o pid,command -g $pg"
+      run_cc discard; assert_code 6
+      assert_file_exists "$ACTIVE/state.json"
+      # 정말 사라지면 기록만 정리한다 (끝 상태·메시지는 그대로)
+      kill -KILL -- "-$pg" 2>/dev/null; wt_until 3 eval '! wt_group_alive "$pg"' || _fail "그룹이 끝나지 않음"
+      run_cc check-orphan; assert_code 0
+      assert_eq "$(state .running)" "null"
+      assert_eq "$(state .last_call.status)" "interrupted"
+      assert_contains "$(state .last_call.message)" "KILL 뒤에도"
+    )
+  done
+  return 0
 }
