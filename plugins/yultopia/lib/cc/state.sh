@@ -58,6 +58,9 @@ cc_state_get() {
 #     rename 은 비어 있지 않은 디렉터리를 덮지 못하므로 한 쪽만 성공하고, owner 가 빈 잠금은 생기지 않는다.
 #   - 기다리기: 최대 CC_STATE_LOCK_WAIT_SECS 초(기본 5).
 #   - 소유자가 확실히 죽었을 때(kill 0 → ESRCH)만 잠금을 치운다. 권한 없음·판단 불가면 살아 있다고 본다.
+#     치우는 쪽끼리는 active 폴더의 flock 으로 한 번에 하나만 "owner 재확인 → rename" 을 한다. 그래서 다른
+#     대기자가 같은 낡은 잠금을 먼저 치우고 새로 잡은 잠금을 이쪽이 옮겨 버리는 일이 없다 (flock 은 프로세스가
+#     끝나면 저절로 풀려 낡은 상태로 남지 않는다). 옮긴 뒤 owner 가 치우려던 죽은 PID 가 아니면 제자리로 되돌린다.
 #   - owner 가 자기 PID 면 자기 잠금이다 (잡은 직후 신호로 깊이 기록만 잃은 경우). 그대로 잡은 것으로 본다.
 #   - 풀기: owner 가 자기일 때만 다른 이름으로 rename 한 뒤 지운다.
 #   - 같은 셸 안에서는 다시 잡아도 된다(깊이만 센다). 이 값은 export 하지 않으므로 자식 프로세스로 넘어가지 않는다.
@@ -74,8 +77,8 @@ cc_state_lock() {
   fi
   a=$(cc_active_dir) || return 1
   [ -d "$a" ] || return 1
-  perl -MTime::HiRes -e '
-    my ($lock, $wait) = @ARGV;
+  perl -MTime::HiRes -MFcntl=:flock -e '
+    my ($lock, $wait, $dir) = @ARGV;
     my $me = getppid();
     my $deadline = Time::HiRes::time() + $wait;
     my $owner_of = sub {
@@ -95,17 +98,33 @@ cc_state_lock() {
       # 자기 PID 의 잠금: 잡은 직후 신호 처리로 깊이 기록만 잃은 경우다 (살아 있는 PID 는 하나뿐). 그대로 쓴다.
       exit 0 if $p eq $me;
       if ($p =~ /^[1-9][0-9]*$/ && !kill(0, $p) && $!{ESRCH}) {
-        # 소유자가 확실히 없다. 그 사이 다른 쪽이 새로 잡지 않았는지 한 번 더 보고 치운다.
-        my $gone = "$lock.stale.$me.$$." . int(rand(1e9));
-        if ($owner_of->($lock) eq $p && rename($lock, $gone)) {
-          unlink "$gone/owner"; rmdir $gone;
-          next;
+        # 소유자가 확실히 없다. 치우는 쪽끼리 flock 으로 줄을 세운 뒤, 그 사이 다른 쪽이 치우고 새로 잡지
+        # 않았는지 owner 를 한 번 더 보고 치운다. 다른 쪽이 치우는 중이면 잠깐 기다렸다 처음부터 다시 본다.
+        # (flock 을 쓸 수 없는 파일 시스템이면 아래 "옮긴 뒤 확인·되돌리기" 에만 기댄다)
+        my ($bf, $may) = (undef, 1);
+        if (open($bf, "<", $dir)) {
+          if (!flock($bf, LOCK_EX | LOCK_NB)) { $may = 0 if $!{EWOULDBLOCK} || $!{EAGAIN} || $!{EINTR} }
+        } else { undef $bf }
+        my $broke = 0;
+        if ($may && $owner_of->($lock) eq $p) {
+          my $gone = "$lock.stale.$me.$$." . int(rand(1e9));
+          if (rename($lock, $gone)) {
+            if ($owner_of->($gone) eq $p) {
+              unlink "$gone/owner"; rmdir $gone;
+              $broke = 1;
+            } elsif (!rename($gone, $lock)) {
+              # 살아 있는 잠금을 옮겼는데 되돌릴 자리를 이미 다른 쪽이 잡았다. 지우지 않고 남겨 둔다.
+              print STDERR "[cc] state.json 잠금을 되돌리지 못했습니다: $gone\n";
+            }
+          }
         }
+        close $bf if $bf;
+        next if $broke;
       }
       exit 1 if Time::HiRes::time() >= $deadline;
       Time::HiRes::sleep(0.05);
     }
-  ' -- "$a/state.lock" "$CC_STATE_LOCK_WAIT_SECS" || return 1
+  ' -- "$a/state.lock" "$CC_STATE_LOCK_WAIT_SECS" "$a" || return 1
   _CC_STATE_LOCK_DEPTH=1
 }
 

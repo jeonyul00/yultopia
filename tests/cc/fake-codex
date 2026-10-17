@@ -13,14 +13,20 @@
 # 환경변수
 #   FAKE_CODEX_SEQ     쉼표로 구분한 호출 순서별 모드 (예: fail_fast,ok). 목록이 끝나면 ok
 #   FAKE_CODEX_RESULT  ok 일 때 -o 파일에 쓸 JSON (기본: 유효한 plan 응답)
-#   FAKE_CODEX_DELAY   slow 모드에서 기다릴 초 (기본 3)
+#   FAKE_CODEX_DELAY   slow·fail_slow 모드에서 기다릴 초 (기본 3)
 #
 # 모드
 #   ok            exec 이면 thread.started(thread_id fake-thread-1), turn.completed(usage 100/20/10), 결과 기록, exit 0
 #   invalid_json  이벤트는 ok 와 같고 -o 에 "not json" 기록, exit 0
+#   invalid_json_no_thread  invalid_json 과 같지만 thread.started 를 쓰지 않음 (세션 ID 를 알 수 없음)
 #   fail_fast     stderr 에 오류 한 줄, exit 1
+#   fail_slow     FAKE_CODEX_DELAY 초 기다린 뒤 fail_fast 와 같음
+#   fail_with_output  -o 에 "not json" 을 쓰고 stderr 에 오류 한 줄, exit 1
 #   hang          명령줄에 테스트 폴더 표시가 있는 자식(sleep 1000)을 만들고 자신도 계속 대기
+#   hang_stubborn hang 과 같지만 자신과 자식 모두 TERM 을 무시 (KILL 로만 끝남)
+#   ok_leave_child  같은 그룹에 자식(sleep 1000)을 남겨 두고 ok 로 끝남. 자식 PID 는 <n>.leftover
 #   slow          FAKE_CODEX_DELAY 초 동안 1초마다 이벤트를 쓰다가 ok
+#   slow_invalid_json  slow 와 같지만 끝에 -o 에 "not json" 기록 (invalid_json 처럼)
 
 log="${FAKE_CODEX_LOG:-${TMP:-/tmp}/fake-codex.log}"
 mkdir -p "$log" || exit 70
@@ -69,15 +75,38 @@ case "$mode" in
     thread_started; turn_completed
     write_out "not json"
     exit 0 ;;
+  invalid_json_no_thread)
+    printf '%s\n' '{"type":"turn.started"}'; turn_completed
+    write_out "not json"
+    exit 0 ;;
   fail_fast)
     echo "fake-codex: 가짜 실행 오류" >&2
+    exit 1 ;;
+  fail_slow)
+    sleep "${FAKE_CODEX_DELAY:-3}"
+    echo "fake-codex: 가짜 실행 오류(늦음)" >&2
+    exit 1 ;;
+  fail_with_output)
+    write_out "not json"
+    echo "fake-codex: 결과를 쓰고 실패" >&2
     exit 1 ;;
   hang)
     thread_started
     perl -e 'sleep 1000' "fake-codex-hang:$log" &
     wait
     exit 0 ;;
-  slow)
+  hang_stubborn)
+    trap '' TERM
+    thread_started
+    perl -e '$SIG{TERM} = "IGNORE"; sleep 1000' "fake-codex-stubborn:$log" &
+    while :; do wait; sleep 0.2; done ;;
+  ok_leave_child)
+    perl -e 'sleep 1000' "fake-codex-leftover:$log" > /dev/null 2>&1 < /dev/null &
+    printf '%s\n' "$!" > "$log/$n.leftover"
+    thread_started; turn_completed
+    write_out "${FAKE_CODEX_RESULT:-$default_result}"
+    exit 0 ;;
+  slow|slow_invalid_json)
     thread_started
     i=0
     while [ "$i" -lt "${FAKE_CODEX_DELAY:-3}" ]; do
@@ -86,7 +115,7 @@ case "$mode" in
       i=$((i + 1))
     done
     turn_completed
-    write_out "${FAKE_CODEX_RESULT:-$default_result}"
+    if [ "$mode" = slow ]; then write_out "${FAKE_CODEX_RESULT:-$default_result}"; else write_out "not json"; fi
     exit 0 ;;
   *)
     echo "fake-codex: 알 수 없는 모드: $mode" >&2

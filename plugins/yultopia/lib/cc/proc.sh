@@ -19,6 +19,8 @@
 #         신원은 맞지만 그 그룹 소속이 아님) → 아무 신호도 보내지 않음
 #     3 = KILL 뒤에도 그룹이 남아 있음
 #   0 만 "죽였다", 1 만 "없다/우리 것 아님" 으로 다룰 수 있다. 2 를 근거로 상태를 지우면 안 된다.
+#   cc_kill_own_group_members (그룹 리더 자신이 부름)
+#     0 = 리더 말고 남은 멤버 없음 / 2 = 거부·판단 불가(신호 안 보냄) / 3 = KILL 뒤에도 멤버가 남음
 
 # 양의 정수(앞자리 0 없음)인지
 _cc_proc_is_pid() {
@@ -235,4 +237,59 @@ cc_kill_group_via_member() {
   _cc_proc_target_pgid_ok "$pgid" || return 2
   _cc_proc_verify_in_group "$member" "$want" "$pgid" || return $?
   _cc_proc_signal_group "$pgid"
+}
+
+# cc_kill_own_group_members <leader_pid>
+#   그룹 리더(감독 프로세스)가 자기 그룹에 남은 다른 프로세스(codex 와 그 자식 등)를 모두 끝낸다.
+#   리더 자신은 건드리지 않는다 (그래서 리더의 TERM 처리기가 돌지 않고, KILL 로 자신이 죽지도 않는다).
+#   - 리더의 메인 셸이 직접 불러야 한다. $(...)·파이프·서브셸 안에서 부르면 거부한다:
+#     perl 의 부모가 <leader_pid> 이고 perl 의 그룹이 <leader_pid> (= 리더가 자기 그룹의 리더) 여야 한다.
+#     리더가 이끄는 그룹에는 리더의 자손만 들어올 수 있으므로 멤버는 모두 우리 프로세스다.
+#   - 그룹 전체 신호(kill -- -PGID)는 리더에게도 가므로 쓰지 않는다. ps 로 멤버를 찾고, 멤버마다 신호 직전에
+#     그 PID 가 아직 이 그룹인지 다시 확인한 뒤 하나씩 보낸다. 좀비는 이미 끝난 것으로 본다.
+#   - TERM → 최대 약 3초 → 남으면 KILL → 최대 약 2초. 그 사이 새로 생긴 멤버도 처음 보일 때 TERM 을 받는다.
+#   0 = 남은 멤버 없음 (신호를 보냈든 처음부터 없었든) / 2 = 거부·판단 불가 (신호 안 보냄) / 3 = KILL 뒤에도 남음
+cc_kill_own_group_members() {
+  local leader="$1"
+  _cc_proc_is_pid "$leader" || return 2
+  perl -MTime::HiRes -e '
+    my ($leader) = @ARGV;
+    exit 2 unless getppid() == $leader && getpgrp(0) == $leader;
+    $SIG{$_} = "IGNORE" for qw(TERM INT HUP);
+    my $members = sub {
+      my $ps = open(my $fh, "-|", "ps", "-A", "-o", "pid=,pgid=,stat=");
+      return undef unless $ps;
+      my @m;
+      while (my $l = <$fh>) {
+        my ($p, $g, $s) = split " ", $l;
+        next unless defined $s && $p =~ /^[0-9]+$/ && $g =~ /^[0-9]+$/ && $g == $leader;
+        next if $p == $leader || $p == $$ || $p == $ps || $s =~ /^Z/;
+        push @m, $p;
+      }
+      close $fh or return undef;
+      return \@m;
+    };
+    my $send = sub { my ($sig, $p) = @_; kill($sig, $p) if getpgrp($p) == $leader };
+    my ($sent, %termed) = (0);
+    my $until = Time::HiRes::time() + 3;
+    while (1) {
+      my $m = $members->();
+      exit($sent ? 3 : 2) unless defined $m;
+      exit 0 unless @$m;
+      for my $p (@$m) { next if $termed{$p}++; $send->("TERM", $p); $sent = 1 }
+      last if Time::HiRes::time() >= $until;
+      Time::HiRes::sleep(0.1);
+    }
+    $until = Time::HiRes::time() + 2;
+    while (1) {
+      my $m = $members->();
+      exit 3 unless defined $m;
+      exit 0 unless @$m;
+      $send->("KILL", $_) for @$m;
+      last if Time::HiRes::time() >= $until;
+      Time::HiRes::sleep(0.1);
+    }
+    print STDERR "cc_proc: KILL 뒤에도 그룹 $leader 에 프로세스가 남아 있습니다\n";
+    exit 3;
+  ' -- "$leader"
 }

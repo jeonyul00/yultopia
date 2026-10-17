@@ -183,6 +183,24 @@ test_state_update_releases_lock_after_failure() {
   assert_eq "$(state .milestone)" "3"
   assert_no_path "$ACTIVE/state.lock"
 }
+test_state_update_concurrent_breakers_of_dead_lock_lose_nothing() {
+  # 죽은 소유자의 잠금을 여러 대기자가 동시에 치우려 해도 살아 있는 잠금을 치우지 않아야 한다 (addendum F)
+  start_task
+  for round in 1 2 3 4; do
+    bash -c 'exit 0' & dead=$!; wait "$dead"
+    mkdir "$ACTIVE/state.lock"; echo "$dead" > "$ACTIVE/state.lock/owner"
+    for i in $(seq 1 12); do
+      ( cc_state_update ".r${round}_$i = $i" || : > "$TMP/.update_failed.$round.$i" ) &
+    done
+    wait
+    for i in $(seq 1 12); do
+      assert_eq "$(state ".r${round}_$i")" "$i" "round $round f$i"
+      assert_no_path "$TMP/.update_failed.$round.$i"
+    done
+    assert_no_path "$ACTIVE/state.lock"
+  done
+  assert_eq "$(ls -A "$ACTIVE" | grep -c '^state\.lock\.')" "0"
+}
 test_state_lock_reclaims_lock_left_by_same_process() {
   # 신호 때문에 잠금을 잡은 기록(깊이)만 잃은 경우: owner 가 자기 PID 면 자기 잠금으로 다시 쓴다
   start_task

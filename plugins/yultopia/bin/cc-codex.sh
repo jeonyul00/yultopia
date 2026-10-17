@@ -84,6 +84,14 @@ cc_cmd_status() {
 }
 
 
+# 사용자가 계속하라고 했을 때만 SKILL 이 부른다: 같은 마일스톤의 연속 반려 횟수를 0 으로
+cc_cmd_ack_rejects() {
+  cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다."; return 1; }
+  cc_active_path_safe || { cc_line "[cc] 상태 폴더 경로가 비정상입니다."; return 1; }
+  cc_state_update '.rejects_in_row = 0' 2>/dev/null || { cc_line "[cc] 상태 파일을 고치지 못했습니다."; return 1; }
+  cc_line "[cc] 연속 반려 횟수를 0으로 되돌렸습니다. 검수를 다시 요청할 수 있습니다."
+}
+
 cc_cmd_finish() {
   cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다."; return 0; }
   cc_delete_active || { cc_line "[cc] 상태 폴더 경로가 비정상이라 삭제하지 않았습니다."; return 1; }
@@ -98,6 +106,7 @@ case "$cmd" in
   status) cc_cmd_status "$@" ;;
   finish) cc_cmd_finish "$@" ;;
   call)   cc_cmd_call "$@" ;;
+  ack-rejects) cc_cmd_ack_rejects "$@" ;;
   _supervise) cc_cmd_supervise "$@" ;;
   *) cc_line "[cc] 알 수 없는 하위 명령: ${cmd:-(없음)}"; exit 1 ;;
 esac

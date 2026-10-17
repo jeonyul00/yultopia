@@ -255,13 +255,16 @@ test_review_refused_at_max_rejects() {
   wait_until_status_file 1
 }
 test_review_and_message_need_session() {
+  # Ruling R14: 세션 없음은 정책 거부(6)가 아니라 오류(1)
   start_task
   printf '%s' "$REVIEW_REPORT" > "$(cc_path report)"
-  run_cc call review; assert_code 6
+  run_cc call review; assert_code 1
   assert_eq "$(call_lines "$OUT")" "1"; assert_contains "$OUT" "세션"
   printf '사용자 지시\n' > "$(cc_path message)"
-  run_cc call message; assert_code 6
+  run_cc call message; assert_code 1
+  assert_eq "$(call_lines "$OUT")" "1"; assert_contains "$OUT" "세션"
   assert_eq "$(state .calls_total)" "0"; assert_eq "$(state .running)" "null"
+  assert_no_path "$FAKE_CODEX_LOG/1.argv"
 }
 test_call_needs_input_files() {
   start_task; set_state '.session_id = "fake-thread-1"'
