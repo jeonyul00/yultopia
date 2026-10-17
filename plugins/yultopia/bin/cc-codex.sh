@@ -4,7 +4,7 @@ SELF="${BASH_SOURCE[0]}"
 SELF_DIR=$(cd "$(dirname "$SELF")" && pwd -P)
 LIB_DIR="$SELF_DIR/../lib/cc"
 
-for _cc_lib in common state snapshot; do
+for _cc_lib in common state snapshot proc; do
   . "$LIB_DIR/$_cc_lib.sh" || { echo "[cc] 내부 오류: $LIB_DIR/$_cc_lib.sh 를 불러오지 못했습니다"; exit 1; }
 done
 
