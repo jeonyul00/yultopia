@@ -68,3 +68,52 @@ test_docs_record_codex_review_round4_fixes() {
   d=$(cat "$CC_REPO_ROOT/docs/superpowers/specs/2026-10-17-yultopia-cc-design.md")
   assert_contains "$d" "Codex 4차 검수 반영"
 }
+# ---- 2026-10-18 보안 수정 (R33/R34) ----
+test_readme_cc_notes_cover_security_fix() {
+  notes=$(awk '/^#### `\/yultopia:cc` 알아둘 것/ { on = 1; next } on && /^##/ { exit } on { print }' "$CC_REPO_ROOT/README.md")
+  # 무시된 비밀·설정 파일과 의존성 폴더도 감시 (범주와 목록 위치)
+  assert_contains "$notes" ".env"
+  assert_contains "$notes" "*.pem"
+  assert_contains "$notes" "node_modules"
+  assert_contains "$notes" ".venv"
+  assert_contains "$notes" "CC_IGNORED_WATCH_PATTERNS"
+  # Codex 가 만든 새 중첩 저장소, git 설정 변경
+  assert_contains "$notes" "중첩 git 저장소"
+  assert_contains "$notes" "git 설정"
+}
+test_design_spec_records_security_fix() {
+  d=$(cat "$CC_REPO_ROOT/docs/superpowers/specs/2026-10-17-yultopia-cc-design.md")
+  assert_contains "$d" "2026-10-18 보안 수정"
+  assert_contains "$d" "R33"
+  assert_contains "$d" "R34"
+  assert_contains "$d" "core.fsmonitor"
+  assert_contains "$d" "HEAD:.gitmodules"
+  assert_contains "$d" "CC_IGNORED_WATCH_PATTERNS"
+}
+test_readme_cc_notes_explain_unwatched_tool_caches() {
+  notes=$(awk '/^#### `\/yultopia:cc` 알아둘 것/ { on = 1; next } on && /^##/ { exit } on { print }' "$CC_REPO_ROOT/README.md")
+  assert_contains "$notes" "node_modules/.cache/"
+  assert_contains "$notes" "node_modules/.vite/"
+  assert_contains "$notes" "CC_IGNORED_WATCH_EXCLUDE"
+  assert_contains "$notes" "다음 빌드"
+}
+test_docs_record_codex_security_review_round1_fixes() {
+  d=$(cat "$CC_REPO_ROOT/docs/superpowers/specs/2026-10-17-yultopia-cc-design.md")
+  assert_contains "$d" "Codex 보안 검수 1차 반영"
+  assert_contains "$d" "gitcfg-quarantine.json"
+  assert_contains "$d" "pre_submodules"
+  notes=$(awk '/^#### `\/yultopia:cc` 알아둘 것/ { on = 1; next } on && /^##/ { exit } on { print }' "$CC_REPO_ROOT/README.md")
+  assert_contains "$notes" "cc/quarantine"      # 2차에서 저장소 밖으로 옮겼다
+  assert_contains "$notes" "하위 모듈 안의 그런 파일도"
+}
+test_docs_record_codex_security_review_round2_fixes() {
+  d=$(cat "$CC_REPO_ROOT/docs/superpowers/specs/2026-10-17-yultopia-cc-design.md")
+  assert_contains "$d" "Codex 보안 검수 2차 반영"
+  assert_contains "$d" "R36"
+  assert_contains "$d" "armed"
+  notes=$(awk '/^#### `\/yultopia:cc` 알아둘 것/ { on = 1; next } on && /^##/ { exit } on { print }' "$CC_REPO_ROOT/README.md")
+  assert_contains "$notes" "~/.claude/plugins/data/yultopia/cc/quarantine"
+  assert_contains "$notes" "release-quarantine"
+  assert_contains "$notes" "자동으로 풀지 않는다"
+  assert_contains "$d" "SessionStart를 포함한 모든 자동 정리"
+}

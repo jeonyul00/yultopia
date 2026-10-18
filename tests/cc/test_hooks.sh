@@ -43,6 +43,53 @@ test_session_start_hook_reports_stale_cleanup() {
   assert_contains "$(printf '%s' "$OUT" | jq -r .systemMessage)" "정리했습니다"
   assert_no_path "$ACTIVE"
 }
+test_session_start_quarantines_legacy_running_record_instead_of_deleting_it() {
+  start_task
+  set_state ".last_activity_at = \"$(hh_iso_ago $((15 * 86400)))\"
+    | .running = {call_id: 1, kind: \"plan\", pgid: 999999, supervisor_identity: \"old|gone\",
+        codex_pid: null, codex_identity: null, started_at: .created_at, review_tree: null,
+        pre_tree: .task_base_tree}"
+  # 옛 호출이 악성 filter 를 남긴 상황. SessionStart 안의 rev-parse 자체는 이를 실행하지 않아야 하고, 이후 preflight 도 격리된다.
+  printf '#!/bin/sh\ntouch "%s/legacy-filter-ran"\ncat\n' "$TMP" > "$TMP/legacy-filter"; chmod +x "$TMP/legacy-filter"
+  git config filter.legacy.clean "$TMP/legacy-filter"
+  printf '* filter=legacy\n' > .gitattributes
+  hh_hook session-start "$PWD"
+  assert_eq "$CODE" "0"
+  assert_contains "$(printf '%s' "$OUT" | jq -r .systemMessage)" "이전 버전"
+  assert_contains "$(printf '%s' "$OUT" | jq -r .systemMessage)" "격리"
+  assert_file_exists "$ACTIVE/state.json"
+  set -- "$CLAUDE_PLUGIN_DATA/cc/quarantine"/*.json
+  q=$1
+  assert_file_exists "$q"
+  assert_eq "$(jq -r .state "$q")" "unverified"
+  assert_eq "$(jq -r .baseline "$q")" "null"
+  assert_no_path "$TMP/legacy-filter-ran"
+  run_cc preflight; assert_code 7
+  assert_eq "$(printf '%s' "$OUT" | jq -r .code)" "git_config_changed"
+  assert_no_path "$TMP/legacy-filter-ran"
+}
+test_session_start_keeps_legacy_record_when_quarantine_write_fails() {
+  start_task
+  set_state ".last_activity_at = \"$(hh_iso_ago $((15 * 86400)))\"
+    | .running = {call_id: 1, kind: \"plan\", pgid: 999999, supervisor_identity: \"old|gone\",
+        codex_pid: null, codex_identity: null, started_at: .created_at, review_tree: null,
+        pre_tree: .task_base_tree}"
+  mkdir -p "$CLAUDE_PLUGIN_DATA/cc/quarantine"
+  chmod 555 "$CLAUDE_PLUGIN_DATA/cc/quarantine"
+  hh_hook session-start "$PWD"
+  assert_eq "$CODE" "0"
+  assert_contains "$(printf '%s' "$OUT" | jq -r .systemMessage)" "격리 기록도 남기지 못해"
+  assert_file_exists "$ACTIVE/state.json"
+  # 외부 기록이 여전히 없어도 다음 진입점은 active 의 옛 기록을 git 없이 먼저 찾아 막는다.
+  mkdir -p "$TMP/git-spy"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/git.calls"\nexec "%s" "$@"\n' "$TMP" "$(command -v git)" > "$TMP/git-spy/git"
+  chmod +x "$TMP/git-spy/git"
+  PATH="$TMP/git-spy:$PATH" run_cc preflight; assert_code 7
+  assert_eq "$(printf '%s' "$OUT" | jq -r .code)" "git_config_changed"
+  assert_eq "$(cat "$TMP/git.calls" 2>/dev/null)" "" "격리 쓰기 실패 뒤 preflight 의 git 호출"
+  assert_file_exists "$ACTIVE/state.json"
+  chmod 755 "$CLAUDE_PLUGIN_DATA/cc/quarantine"
+}
 test_session_start_hook_silent_for_fresh_record() {
   start_task
   hh_hook session-start "$PWD"

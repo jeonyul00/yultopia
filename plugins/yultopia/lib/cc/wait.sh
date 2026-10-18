@@ -197,11 +197,17 @@ _cc_wait_heartbeat() {
 # 훅(메시지마다·세션 시작)은 빨라야 하므로 스냅샷을 뜨지 않는다: cc-codex.sh 가 _CC_EDIT_SETTLE_OK=1 로 둔 실행에서만 하고,
 #   그 밖에서 다시 비교가 필요한 기록을 만나면 정리하지 않고 그대로 둔다 (다음 wait·check-orphan·preflight·call 이 한다).
 
-# _cc_edit_recheck_prepare <id> : _CC_EF = none(필요 없음) | skip(필요하지만 여기서는 안 함) | same | modified | unknown,
-#   _CC_EF_PRE / _CC_EF_POST / _CC_EF_MSG (modified: 그 한 줄, unknown: 확인 실패 문구)
+# 2026-10-18 보안 수정 (R33/R34): 다시 비교도 감독 프로세스와 같은 순서다. 먼저 running.pre_gitcfg 로 git 설정 지문을 git 없이
+#   다시 계산해 비교하고, 바뀌었으면 스냅샷(git 명령)을 뜨지 않고 gitcfg 로 정한다. 그다음 작업 트리 스냅샷과
+#   calls/<id>/ignored.pre (요약값 running.pre_ignored) 를 지금의 감시 대상 무시 파일과 비교한다. 지문이나 manifest 기록이
+#   없거나(이전 버전의 기록 포함) 맞지 않으면 확인할 수 없는 것(unknown)으로 본다: 확인하지 않은 설정으로 git 을 돌리지 않는다.
+# _cc_edit_recheck_prepare <id> : _CC_EF = none(필요 없음) | skip(필요하지만 여기서는 안 함) | same | modified | unknown | gitcfg,
+#   _CC_EF_PRE / _CC_EF_POST / _CC_EF_MSG (modified·gitcfg: 그 한 줄, unknown: 확인 실패 문구),
+#   _CC_EF_IGN (modified 의 바뀐 감시 대상 무시 파일 요약 JSON 또는 null), _CC_EF_GCF (gitcfg 의 바뀐 설정 파일 요약 JSON 또는 null)
 _cc_edit_recheck_prepare() {
-  local id="$1" pre post lpre lpost
-  _CC_EF=none; _CC_EF_PRE=""; _CC_EF_POST=""; _CC_EF_MSG=""; _CC_EF_BASE=""
+  local id="$1" pre post lpre lpost lign lgcf gcf psum subs gc r ign tmp gd
+  _CC_EF=none; _CC_EF_PRE=""; _CC_EF_POST=""; _CC_EF_MSG=""; _CC_EF_BASE=""; _CC_EF_IGN=null; _CC_EF_GCF=null
+  _CC_EF_ROOT=""; _CC_EF_QFAIL=0
   # 이미 codex_modified 로 기록된 stop_failed 기록도 다시 비교한다: 첫 비교 뒤에 남은 프로세스가 더 바꿨을 수 있다
   #   (Codex 리뷰 2차). 최종 결과로 post_tree·메시지를 고치되 앞서 찾은 증거는 지우지 않는다 (아래 recheck)
   pre=$(jq -r --argjson id "$id" '
@@ -211,22 +217,88 @@ _cc_edit_recheck_prepare() {
   [ -n "$pre" ] || return 0
   if [ "${_CC_EDIT_SETTLE_OK:-0}" != 1 ]; then _CC_EF=skip; return 0; fi
   _CC_EF_PRE=$pre
-  # 이미 codex_modified 로 기록된 호출이면 저장된 pre_tree/post_tree 로 증거 한 줄을 다시 만든다 (Codex 리뷰 3차 1:
-  #   최종 결과를 붙일 때 처음 줄의 "다시 확인합니다"·종료 미확인 경고·ps 안내를 남기지 않도록)
-  { IFS= read -r lpre; IFS= read -r lpost; } <<EOF
+  { IFS= read -r gcf; IFS= read -r psum; IFS= read -r subs; } <<EOF
+$(jq -r --argjson id "$id" '
+    if (.running | type) == "object" and .running.call_id == $id then
+      (if (.running.pre_gitcfg | type) == "object" then (.running.pre_gitcfg | tojson) else "" end),
+      (if (.running.pre_ignored | type) == "string" then .running.pre_ignored else "" end),
+      (if (.running.pre_submodules | type) == "array" then (.running.pre_submodules | tojson) else "" end)
+    else empty end' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+EOF
+  gd=${_CC_WAIT_ACTIVE%/yultopia-cc/active}
+  # 외부 격리 기록의 열쇠: 실행 전에 감독 프로세스가 정한 작업 트리 실제 경로 (없으면 init 때의 repo_root 를 실제 경로로).
+  #   정할 수 없으면 기록을 확인·남길 수 없으므로 막는 쪽: 아무것도 비교하지 않고 이 기록을 정리하지도 않는다 (Codex 보안 검수 2차)
+  _CC_EF_ROOT=$(jq -r --argjson id "$id" '
+      if (.running | type) == "object" and .running.call_id == $id and (.running.pre_root | type) == "string"
+         and .running.pre_root != "" then .running.pre_root else (.repo_root // empty) end' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+  [ -n "$_CC_EF_ROOT" ] && _CC_EF_ROOT=$(cd -P "$_CC_EF_ROOT" 2>/dev/null && pwd -P) || _CC_EF_ROOT=""
+  if [ -z "$_CC_EF_ROOT" ]; then
+    _CC_EF=unverified; _CC_EF_MSG=$(_cc_gitcfg_unverified_note); _CC_EF_QFAIL=1; return 0
+  fi
+  # 0) 외부 격리 기록이 있으면 그 기준과 먼저 비교한다 (git 을 부르지 않는다. armed 이고 지금 같으면 이 호출의 비교를 이어 한다)
+  if ! cc_quarantine_eval "$_CC_EF_ROOT" "$_CC_WAIT_ACTIVE/state.json"; then
+    if [ "$_CC_GITCFG_TAMPER_UNSURE" = 1 ]; then
+      _CC_EF=unverified; _CC_EF_MSG=$(_cc_gitcfg_unverified_note)
+    else
+      _CC_EF=gitcfg; _CC_EF_GCF=${_CC_GITCFG_TAMPER_SUMMARY:-null}; _CC_EF_MSG=$(_cc_gitcfg_message "$_CC_EF_GCF")
+    fi
+    return 0
+  fi
+  # 1) git 설정 (git 을 부르지 않는다). 기록(지문·manifest 요약·하위 모듈 allowlist)이 없으면(이전 버전의 기록 등) git 설정 무결성을
+  #   확인할 수 없으므로 git 을 돌리지 않는다 (Codex 보안 검수 1차 5: "작업 트리를 확인하지 못해" 와 다른 상태·문구, git diff 권하지 않음).
+  #   기준 없는 unverified 외부 기록을 남겨, 사용자가 확인해 지우기(release-quarantine) 전까지 모든 새 명령이 git 을 쓰지 않는다
+  #   (Codex 보안 검수 2차 2). 그 기록을 남기지 못하면 이 기록을 정리하지 않는다 (fail closed: 다음에 다시)
+  if [ -z "$gcf" ] || [ -z "$psum" ] || [ -z "$subs" ]; then
+    _CC_EF=unverified; _CC_EF_MSG=$(_cc_gitcfg_unverified_note)
+    cc_quarantine_put "$_CC_EF_ROOT" unverified null null "$id" || _CC_EF_QFAIL=1
+    return 0
+  fi
+  gc=$(cc_gitcfg_verify "$gcf"); r=$?
+  case "$r" in
+    0) ;;
+    1)
+      _CC_EF=gitcfg; _CC_EF_GCF=$gc; _CC_EF_MSG=$(_cc_gitcfg_message "$gc")
+      cc_quarantine_put "$_CC_EF_ROOT" tampered "$gcf" "$gc" "$id" keep || _CC_EF_QFAIL=1
+      return 0 ;;
+    *)
+      _CC_EF=unverified; _CC_EF_MSG=$(_cc_gitcfg_unverified_note)
+      cc_quarantine_put "$_CC_EF_ROOT" unverified "$gcf" null "$id" keep || _CC_EF_QFAIL=1
+      return 0 ;;
+  esac
+  # 이미 codex_modified 로 기록된 호출이면 저장된 pre_tree/post_tree(와 감시 대상 무시 파일 목록, git 설정 목록)로 증거 한 줄을
+  #   다시 만든다 (Codex 리뷰 3차 1: 최종 결과를 붙일 때 처음 줄의 "다시 확인합니다"·종료 미확인 경고·ps 안내를 남기지 않도록)
+  { IFS= read -r lpre; IFS= read -r lpost; IFS= read -r lign; IFS= read -r lgcf; } <<EOF
 $(jq -r --argjson id "$id" '
     if (.last_call | type) == "object" and .last_call.call_id == $id and .last_call.status == "codex_modified"
-       and (.last_call.pre_tree | type) == "string" and (.last_call.post_tree | type) == "string"
-    then .last_call.pre_tree, .last_call.post_tree else empty end' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
+       and (.last_call.pre_tree | type) == "string"
+    then .last_call.pre_tree, (.last_call.post_tree // ""), (.last_call.ignored_changed // null | tojson),
+         (.last_call.gitcfg_changed // null | tojson) else empty end' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)
 EOF
-  [ -n "$lpre" ] && [ -n "$lpost" ] && _CC_EF_BASE=$(_cc_edit_modified_message "$lpre" "$lpost")
-  post=$(cc_snapshot_tree) || post=""
+  if [ -n "$lgcf" ] && [ "$lgcf" != null ]; then
+    _CC_EF_BASE=$(_cc_gitcfg_message "$lgcf")
+  elif [ -n "$lpre" ] && [ -n "$lpost" ]; then
+    _CC_EF_BASE=$(_cc_edit_modified_message "$lpre" "$lpost" "$lign")
+  fi
+  # 2) 작업 트리 스냅샷과 감시 대상 무시 파일
+  post=$(cc_snapshot_tree "$subs") || post=""
+  ign=""
+  if [ -n "$post" ]; then
+    tmp=$(mktemp "$_CC_WAIT_ACTIVE/.ignored.recheck.XXXXXX" 2>/dev/null) || tmp=""
+    if [ -n "$tmp" ] && cc_ignored_manifest "$tmp" "$subs" >/dev/null \
+       && ign=$(cc_ignored_diff "$_CC_WAIT_ACTIVE/calls/$id/ignored.pre" "$psum" "$tmp"); then
+      :
+    else
+      post=""
+    fi
+    [ -n "$tmp" ] && rm -f "$tmp"
+  fi
   if [ -z "$post" ]; then
     _CC_EF=unknown; _CC_EF_MSG=$(_cc_edit_uncheck_note "$pre")
-  elif [ "$post" = "$pre" ]; then
+  elif [ "$post" = "$pre" ] && [ -z "$ign" ]; then
     _CC_EF=same; _CC_EF_POST=$post
   else
-    _CC_EF=modified; _CC_EF_POST=$post; _CC_EF_MSG=$(_cc_edit_modified_message "$pre" "$post")
+    _CC_EF=modified; _CC_EF_POST=$post; _CC_EF_IGN=${ign:-null}
+    _CC_EF_MSG=$(_cc_edit_modified_message "$pre" "$post" "$ign")
   fi
 }
 
@@ -248,8 +320,14 @@ _CC_WAIT_SETTLE_WRITER=_cc_state_update_nolock
 _cc_wait_settle() {
   local id="$1" st="${2:-}" msg="${3:-}" keep=0 final dir cur rc=1
   [ "${4:-}" = keep ] && keep=1
-  _CC_EF=none; _CC_EF_PRE=""; _CC_EF_POST=""; _CC_EF_MSG=""; _CC_EF_BASE=""
+  _CC_EF=none; _CC_EF_PRE=""; _CC_EF_POST=""; _CC_EF_MSG=""; _CC_EF_BASE=""; _CC_EF_IGN=null; _CC_EF_GCF=null
+  _CC_EF_ROOT=""; _CC_EF_QFAIL=0
   [ -n "$st" ] && [ "$keep" = 0 ] && _cc_edit_recheck_prepare "$id"
+  # 외부 격리 기록을 남기지 못했으면 이 기록을 정리하지 않는다: running 이 남아 다음 진입점이 다시 확인한다 (fail closed. Codex 보안 검수 2차)
+  if [ "${_CC_EF_QFAIL:-0}" = 1 ]; then
+    cc_err "[cc] git 설정 격리 기록을 남기지 못해 호출 $id 의 기록을 정리하지 않았습니다"
+    return 1
+  fi
   cc_state_lock || return 1
   if [ -n "$st" ] && [ "$_CC_EF" != skip ]; then
     $_CC_WAIT_SETTLE_WRITER '
@@ -276,9 +354,28 @@ _cc_wait_settle() {
           #   최종 트리가 기록과 다르면 post_tree 와 메시지를 최종 값으로 고친다 (남은 프로세스의 나중 변경까지).
           #   그 밖에는 저장된 pre/post 로 다시 만든 증거 한 줄($efbase)에 최종 결과만 붙인다 (Codex 리뷰 3차 1)
           (if $efbase != "" then .last_call.message = $efbase else . end) as $b
-          | if $ef == "modified" and (.last_call.post_tree // "") != $efpost then
+          | (.last_call.gitcfg_changed // null) as $hadgcf
+          | if $ef == "gitcfg" then
+              # 최종 비교에서 git 설정이 바뀐 것을 찾았다 (R33): 스냅샷은 뜨지 않았다. 앞서 찾은 증거는 그대로 둔다
+              if $hadgcf != null then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인: git 설정이 여전히 바뀌어 있어 작업 트리는 비교하지 않음")
+              else $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인하지 못함: " + ($efmsg | sub("^\\[cc\\] "; "")))
+                   | .last_call.gitcfg_changed = $efgcf end
+            elif $ef == "unverified" then
+              # git 설정 무결성을 확인하지 못했다 (Codex 보안 검수 1차 5): 앞서 찾은 증거는 그대로 두고 그 사실만 붙인다 (git diff 없음)
+              $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인하지 못함: " + $efmsg) | .last_call.gitcfg_unverified = true
+            elif $hadgcf != null then
+              # git 설정이 바뀌어 멈춘 기록 (그 사이 설정이 돌아와 비교할 수 있었음): 그 증거는 그대로 두고 비교 결과만 붙인다
+              if $ef == "modified" then
+                $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인: " + ($efmsg | sub("^\\[cc\\] "; "")))
+                | .last_call.post_tree = $efpost
+                | (if $efign != null then .last_call.ignored_changed = $efign else . end)
+              elif $ef == "same" then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인: 작업 트리는 실행 전과 같음")
+              elif $ef == "unknown" then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인하지 못함: " + $efmsg)
+              else . end
+            elif $ef == "modified" and ((.last_call.post_tree // "") != $efpost or (.last_call.ignored_changed // null) != $efign) then
               .last_call = (.last_call + {message: ($efmsg + " (남은 Codex 프로세스가 끝난 뒤 다시 확인한 최종 결과)"),
-                                          pre_tree: $efpre, post_tree: $efpost, verdict: null})
+                                          pre_tree: $efpre, post_tree: $efpost, verdict: null}
+                            | if $efign != null then .ignored_changed = $efign else del(.ignored_changed) end)
             elif $ef == "modified" then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인: 추가로 바뀐 파일 없음")
             elif $ef == "same" then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인: 지금 작업 트리는 실행 전과 같음 (앞서 찾은 변경 기록은 그대로 둠)")
             elif $ef == "unknown" then $b | note("남은 Codex 프로세스가 끝난 뒤 다시 확인하지 못함: " + $efmsg)
@@ -286,7 +383,19 @@ _cc_wait_settle() {
           | .phase = "failed"
         elif $ef == "modified" then
           .last_call = (.last_call + {status: "codex_modified", verdict: null, message: $efmsg,
-                                      pre_tree: $efpre, post_tree: $efpost})
+                                      pre_tree: $efpre, post_tree: $efpost}
+                        | if $efign != null then .ignored_changed = $efign else . end)
+          | .phase = "failed"
+        elif $ef == "gitcfg" then
+          # git 설정이 바뀌었다 (R33): 실행 뒤 스냅샷을 뜨지 않았다 (post_tree 없음)
+          .last_call = (.last_call + {status: "codex_modified", verdict: null, message: $efmsg,
+                                      pre_tree: $efpre, gitcfg_changed: $efgcf} | del(.post_tree))
+          | .phase = "failed"
+        elif $ef == "unverified" then
+          # git 설정 무결성을 확인하지 못해 실행 뒤 비교(git)를 하지 않았다 (Codex 보안 검수 1차 5)
+          .last_call = (.last_call + {status: "error", verdict: null, pre_tree: $efpre, gitcfg_unverified: true,
+                                      message: ((if (.last_call.message | type) == "string" and .last_call.message != ""
+                                                 then .last_call.message + " · " else "[cc] " end) + $efmsg)})
           | .phase = "failed"
         elif $ef == "unknown" then
           .last_call = (.last_call + {status: "error", verdict: null, pre_tree: $efpre,
@@ -307,6 +416,7 @@ _cc_wait_settle() {
         end
       else . end' --argjson id "$id" --arg st "$st" --arg msg "$msg" --argjson keep "$keep" \
         --arg ef "$_CC_EF" --arg efpre "$_CC_EF_PRE" --arg efpost "$_CC_EF_POST" --arg efmsg "$_CC_EF_MSG" --arg efbase "${_CC_EF_BASE:-}" \
+        --argjson efign "${_CC_EF_IGN:-null}" --argjson efgcf "${_CC_EF_GCF:-null}" \
       || cc_err "[cc] 호출 $id 의 끝 상태를 기록하지 못했습니다"
   fi
   final=$(jq -r --argjson id "$id" '
@@ -328,17 +438,24 @@ _cc_wait_settle() {
     rc=0
   fi
   cc_state_unlock
+  # 그룹이 사라진 것을 확인하고 지문 확인 + 실행 뒤 비교 + 최종 기록을 마쳤으면 그 호출의 armed 외부 기록을 지운다 (R36)
+  if [ "$rc" -eq 0 ] && [ -n "${_CC_EF_ROOT:-}" ]; then
+    case "$_CC_EF" in
+      same|modified) cc_quarantine_release "$_CC_EF_ROOT" armed "$id" || cc_err "[cc] 호출 $id 의 git 설정 격리 기록을 지우지 못했습니다" ;;
+    esac
+  fi
   return "$rc"
 }
 
-# _CC_EDIT_FLAG_FILTER : 이 호출의 last_call 이 알릴 것(codex_modified 또는 확인 실패)이면 "상태|post_tree|확인 실패 여부" 한 줄
+# _CC_EDIT_FLAG_FILTER : 이 호출의 last_call 이 알릴 것(codex_modified 또는 확인 실패)이면 "상태|post_tree|감시 대상 무시 파일|git 설정|확인 실패 여부" 한 줄
 #   (아니면 빈 출력). 정리 전후를 이 값으로 비교한다: 메시지에 "추가로 바뀐 파일 없음" 같은 최종 결과가 붙기만 했으면
 #   새로 알릴 것이 아니다 (Codex 리뷰 2차). jq 인자 $id, $mark
 _CC_EDIT_FLAG_FILTER='
   if (.last_call | type) == "object" and .last_call.call_id == $id
      and (.last_call.status == "codex_modified"
-          or ((.last_call.message | type) == "string" and (.last_call.message | contains($mark))))
-  then "\(.last_call.status)|\(.last_call.post_tree // "")|\((.last_call.message // "") | contains($mark))" else empty end'
+          or ((.last_call.message | type) == "string" and (.last_call.message | contains($mark)))
+          or .last_call.gitcfg_unverified == true)
+  then "\(.last_call.status)|\(.last_call.post_tree // "")|\(.last_call.ignored_changed // null | tojson)|\(.last_call.gitcfg_changed // null | tojson)|\(.last_call.gitcfg_unverified // false)|\((.last_call.message // "") | contains($mark))" else empty end'
 
 # _cc_edit_settle_dead <id> : 확실히 끝난(dead) 호출 <id> 의 기록에 running.pre_tree 가 있으면 정리하며 다시 비교한다
 #   (_cc_wait_settle. 끝 상태가 없으면 interrupted 로). 이번 정리로 새로 알게 된 것(codex_modified 를 새로 찾음, post_tree 가
@@ -550,12 +667,14 @@ _cc_wait_interrupt() {
 #   - 메시지에 실행 뒤 작업 트리 확인 실패가 적혀 있으면 → 그 부분
 #   check-orphan --kill (housekeeping.sh) 도 쓴다. _CC_WAIT_ACTIVE 가 정해져 있어야 한다.
 _CC_WAIT_UNCHECK_MARK="실행 뒤 작업 트리를 확인하지 못해"
+_CC_WAIT_UNVERIFIED_MARK="git 설정 무결성을 확인하지 못해"      # call.sh _cc_gitcfg_unverified_note (Codex 보안 검수 1차 5)
 _cc_wait_edit_note() {
   local id="$1" final="$2" note
-  note=$(jq -r --argjson id "$id" --arg st "$final" --arg mark "$_CC_WAIT_UNCHECK_MARK" '
+  note=$(jq -r --argjson id "$id" --arg st "$final" --arg mark "$_CC_WAIT_UNCHECK_MARK" --arg mark2 "$_CC_WAIT_UNVERIFIED_MARK" '
       if (.last_call | type) == "object" and .last_call.call_id == $id then
         (.last_call.message | if type == "string" then gsub("\\p{Cc}+"; " ") else "" end) as $m
         | if $st == "codex_modified" then ($m | sub("^\\[cc\\] "; ""))
+          elif ($m | contains($mark2)) then $mark2 + ($m | split($mark2) | .[1:] | join($mark2))
           elif ($m | contains($mark)) then $mark + ($m | split($mark) | .[1:] | join($mark))
           else empty end
       else empty end' "$_CC_WAIT_ACTIVE/state.json" 2>/dev/null)

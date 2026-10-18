@@ -392,6 +392,7 @@ test_codex_identity_recorded_even_when_exec_is_late() {
   set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $$, supervisor_identity: \"x|y\",
     codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
   _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"
+  _CC_SUP_ROOT=$(pwd -P)   # _cc_sup_main 이 정하는 작업 트리 실제 경로 (외부 격리 기록의 열쇠, Codex 보안 검수 2차)
   mkdir -p "$_CC_SUP_DIR"; printf '프롬프트\n' > "$_CC_SUP_DIR/prompt.md"
   CC_CODEX_BIN=cf_slow_exec_codex
   _cc_sup_run_codex exec - "$_CC_SUP_DIR/prompt.md" >> "$TMP/sup.log" 2>&1
@@ -450,7 +451,7 @@ test_timeout_fallback_kills_term_ignoring_codex() {
   # 감독 프로세스 대역은 이 테스트 셸이다: running.pgid 를 이 셸($$)로 둔다 (감독 프로세스는 자기 기록만 고친다)
   set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $$, supervisor_identity: \"x|y\",
     codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
-  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_CLAIMED=1; _CC_SUP_TIMED_OUT=0
+  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_CLAIMED=1; _CC_SUP_TIMED_OUT=0; _CC_SUP_ROOT=$(pwd -P)
   mkdir -p "$_CC_SUP_DIR"; printf '프롬프트\n' > "$_CC_SUP_DIR/prompt.md"
   CC_CALL_TIMEOUT_SECS=1; _cc_sup_init_config
   _cc_sup_run_codex exec - "$_CC_SUP_DIR/prompt.md" >> "$TMP/sup.log" 2>&1
@@ -491,7 +492,7 @@ test_supervisor_leaves_same_call_id_with_other_pgid_untouched() {
   set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $other, supervisor_identity: \"x|y\",
     codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
   before=$(jq -cS 'del(.last_activity_at)' "$ACTIVE/state.json")
-  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; mkdir -p "$_CC_SUP_DIR"
+  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; mkdir -p "$_CC_SUP_DIR"; _CC_SUP_ROOT=$(pwd -P)
   _cc_sup_init_config; _CC_SUP_ATTEMPT=1
   # codex 신원 기록
   _cc_sup_set_codex_identity 4242 "Thu Jan  1 00:00:00 2020|codex" >/dev/null 2>&1
@@ -659,7 +660,7 @@ cf_sup_standin_run() {   # <stop rc> <timeout|normal>
   }
   set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $$, supervisor_identity: \"x|y\",
     codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
-  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_CLAIMED=1
+  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_CLAIMED=1; _CC_SUP_ROOT=$(pwd -P)
   _CC_SUP_DONE=0; _CC_SUP_SIGNAL=""; _CC_SUP_CODEX_PID=""; _CC_SUP_CODEX_IDENT=""; _CC_SUP_FINAL=""
   _CC_SUP_CODEX_RECORDED=0; _CC_SUP_ATTEMPT=1; _CC_SUP_ATTEMPT_SECS=0; _CC_SUP_T0=""; _CC_SUP_TIMED_OUT=0
   _CC_SUP_REC=""; _CC_SUP_NO_START=0
@@ -713,7 +714,7 @@ test_codex_not_started_when_pre_tree_cannot_be_recorded() {
   # running 이 이 감독 프로세스(이 테스트 셸, pgid=$$)를 가리키지 않으면 기록할 수 없다
   set_state ".calls_total = 1 | .running = {call_id: 1, kind: \"plan\", pgid: $(( $$ + 100000 )), supervisor_identity: \"x|y\",
     codex_pid: null, codex_identity: null, started_at: \"2026-01-01T00:00:00Z\", review_tree: null}"
-  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_ATTEMPT=1
+  _CC_SUP_ID=1; _CC_SUP_ACTIVE="$ACTIVE"; _CC_SUP_DIR="$ACTIVE/calls/1"; _CC_SUP_ATTEMPT=1; _CC_SUP_ROOT=$(pwd -P)
   mkdir -p "$_CC_SUP_DIR"; printf '프롬프트\n' > "$_CC_SUP_DIR/prompt.md"
   _cc_sup_init_config
   _cc_sup_run_codex exec - "$_CC_SUP_DIR/prompt.md" >> "$TMP/sup.log" 2>&1; rc=$?

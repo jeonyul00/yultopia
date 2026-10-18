@@ -357,6 +357,32 @@ _cc_hk_stale_reason() {
   esac
 }
 
+# _cc_hk_quarantine_legacy_running : 실행 전 트리는 있지만 git 설정 지문/무시 파일 manifest/하위 모듈 allowlist 중 하나가 없는
+#   옛 running 기록이면, 현재 작업 트리의 정규화된 경로로 저장소 밖 unverified 격리 기록을 남긴다. git 을 부르지 않는다.
+#   0 = 옛 기록을 격리함 (_CC_HK_LEGACY_ID), 1 = 해당 없음, 2 = 격리 실패. 자동 정리는 0/2 모두 active 를 지우지 않는다.
+_cc_hk_quarantine_legacy_running() {
+  local a root here
+  _CC_HK_LEGACY_ID=""
+  a=$(cc_active_dir 2>/dev/null) || return 2
+  _CC_HK_LEGACY_ID=$(cc_legacy_running_id "$a/state.json")
+  [ -n "$_CC_HK_LEGACY_ID" ] || return 1
+
+  # state.json 의 repo_root 는 옛 Codex 호출이 바꿨을 수 있으므로 우선 믿지 않는다. 현재 위치에서 셸만으로 찾은 작업 트리
+  # 루트를 쓰고, 찾지 못할 때만 state 의 경로가 현재 위치의 조상인지 확인해 쓴다.
+  root=""
+  if _cc_repo_discover && [ -n "${_CC_DISC_TOP:-}" ]; then
+    root=$_CC_DISC_TOP
+  else
+    root=$(jq -r '.repo_root // empty' "$a/state.json" 2>/dev/null)
+    [ -n "$root" ] && root=$(cd -P "$root" 2>/dev/null && pwd -P) || root=""
+    here=$(pwd -P 2>/dev/null) || here=""
+    case "$here/" in "$root/"*) ;; *) root="" ;; esac
+  fi
+  [ -n "$root" ] || return 2
+  cc_quarantine_put "$root" unverified null null "$_CC_HK_LEGACY_ID" || return 2
+  return 0
+}
+
 # _cc_hk_cleanup_stale : 알릴 한 줄을 _CC_HK_LINE 에 (할 일이 없으면 빈 값). 프로세스는 건드리지 않는다.
 #   경로 비정상(심볼릭 링크 등)이면 그 안의 기록을 믿지 않고 나이와 상관없이 지우지 않는다고 알린다.
 _cc_hk_cleanup_stale() {
@@ -376,6 +402,23 @@ _cc_hk_cleanup_stale() {
     none|dead) ;;
     *) _cc_hk_stale_reason; return 0 ;;
   esac
+  # 지문 없는 옛 호출은 SessionStart 를 포함한 어느 자동 정리에서도 그냥 지우지 않는다. 먼저 저장소 밖에 baseline:null
+  # unverified 기록을 남기고 멈춘다. 다음 진입점부터는 사용자가 직접 확인하고 release-quarantine 하기 전까지 git 을 쓰지 않는다.
+  # 기록 쓰기가 실패해도 active 를 남겨 다음 기회에 다시 시도한다 (Codex 보안 검수 2차 후속).
+  if [ "$_CC_HK_RS" = dead ]; then
+    _cc_hk_quarantine_legacy_running
+    r=$?
+    case "$r" in
+      0)
+        _CC_HK_LINE="[cc] 오래된 /cc 기록은 이전 버전이라 git 설정 변경 여부를 확인할 수 없어 격리했고 지우지 않았습니다. git 설정 파일을 직접 확인하세요"
+        return 0 ;;
+      2)
+        _CC_HK_LINE="[cc] 오래된 /cc 기록은 git 설정 변경 여부를 확인할 수 없고 격리 기록도 남기지 못해 지우지 않았습니다"
+        return 0 ;;
+    esac
+  fi
+  # (Codex 가 바꾼 git 설정의 격리 기록은 active 와 따로 남으므로 여기서 지워도 된다. cc-codex.sh 의 cleanup-stale 은 격리 중이면
+  #  여기까지 오지 않는다: cc_quarantine_gate)
   # 끝난 기록에 실행 전 트리(running.pre_tree)가 있으면 지우기 전에 최종 다시 비교한다 (Codex 리뷰 3차 2). 정리는 활동이
   #   아니므로 last_activity_at 은 그대로 둔다. 새로 알게 된 것(Codex 의 파일 수정, 최종 확인 실패)이 있으면 이번에는 지우지
   #   않고 그 한 줄을 알린다 (preflight 의 stale_notice). 사용자가 부른 cc-codex.sh 에서만 한다: 세션 시작 훅은 스냅샷을 뜨지
@@ -415,12 +458,39 @@ cc_cmd_cleanup_stale() {
 # _cc_hk_remove_active <완료 줄> : Codex 가 돌 수 있으면(alive·uncertain) 6 과 한 줄, 아니면 active 를 지운다
 #   (R8: 판단할 수 없음은 삭제의 근거가 아니다. 남은 그룹이면 PGID 와 확인 방법을 알린다)
 _cc_hk_remove_active() {
-  local done_line="$1" r g cmds=""
-  cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다."; return 0; }
+  local done_line="$1" r g cmds="" warn="" list a legacy root
+  # Codex 가 바꾼 git 설정이 아직 그대로면(격리 중: cc-codex.sh 의 cc_quarantine_gate) git 을 돌리지 않고 지운다. 외부 격리 기록은
+  #   작업 기록과 따로 남아 새 작업도 막는다는 것을 줄 끝에 알린다 (Codex 보안 검수 1·2차)
+  if [ "${_CC_QUARANTINED:-0}" = 1 ]; then
+    list=$(_cc_edit_summary_text "$_CC_GITCFG_TAMPER_SUMMARY"); [ -n "$list" ] || list="(목록을 읽지 못함)"
+    if [ "$_CC_GITCFG_TAMPER_UNSURE" = 1 ]; then
+      warn="주의: git 설정 무결성을 확인하지 못해(기록된 파일: $list) 사용자가 확인하기 전에는 /cc 가 git 명령을 실행하지 않습니다(새 작업도 시작하지 않음). 기록: ${_CC_GITCFG_QUARANTINE:-?}"
+    else
+      warn="주의: Codex가 바꾼 git 설정 파일이 아직 실행 전과 다릅니다: $list. 되돌리기 전에는 /cc 가 git 명령을 실행하지 않습니다(새 작업도 시작하지 않음). git 명령을 쓰기 전에 직접 확인해 되돌리세요"
+    fi
+  fi
+  cc_active_exists || { cc_line "[cc] 진행 중인 작업이 없습니다.${warn:+ · $warn}"; return 0; }
   cc_active_path_safe || { cc_line "[cc] 상태 폴더 경로가 비정상이라 삭제하지 않았습니다."; return 1; }
+  # 지문 없이 남은 이전 버전의 호출 기록(실행 전 트리만 있음)은 지우기 전에 기준 없는 unverified 외부 격리 기록을 남긴다:
+  #   그 호출이 git 설정을 바꿨는지 알 수 없으므로 사용자가 확인하기 전까지 git 을 쓰지 않는다 (Codex 보안 검수 2차 2). 못 남기면 지우지 않는다
+  if [ "${_CC_QUARANTINED:-0}" != 1 ] && a=$(cc_active_dir 2>/dev/null); then
+    legacy=$(jq -r 'if (.running | type) == "object" and (.running.pre_tree | type) == "string"
+                       and ((.running.pre_gitcfg | type) != "object" or (.running.pre_submodules | type) != "array"
+                            or (.running.pre_ignored | type) != "string")
+                    then (.running.call_id // "?" | tostring) else empty end' "$a/state.json" 2>/dev/null)
+    if [ -n "$legacy" ]; then
+      root=$(jq -r '.running.pre_root // .repo_root // empty' "$a/state.json" 2>/dev/null)
+      [ -n "$root" ] && root=$(cd -P "$root" 2>/dev/null && pwd -P) || root=""
+      if [ -z "$root" ] || ! cc_quarantine_put "$root" unverified null null "$legacy"; then
+        cc_line "[cc] 이전 호출이 git 설정을 바꿨는지 확인할 수 없는데 격리 기록을 남기지 못해 지우지 않았습니다."
+        return 1
+      fi
+      warn="주의: 이전 호출 $legacy 이 git 설정을 바꿨는지 확인할 수 없어 사용자가 확인하기 전에는 /cc 가 git 명령을 실행하지 않습니다"
+    fi
+  fi
   _cc_hk_delete_if_idle ""; r=$?
   case "$r" in
-    0) cc_line "$done_line"; return 0 ;;
+    0) cc_line "$done_line${warn:+ · $warn}"; return 0 ;;
     2) cc_line "[cc] 상태 파일이 잠겨 있어 지우지 못했습니다. 잠시 뒤 다시 시도하세요."; return 1 ;;
     3) cc_line "[cc] 상태 폴더를 지우지 못했습니다."; return 1 ;;
   esac
@@ -461,11 +531,12 @@ _cc_hk_active_json() {
 # _cc_hk_dirty_scan <저장소 루트> : 커밋되지 않은 변경과 무시 목록에 없는 untracked 파일
 #   _CC_HK_DIRTY = 앞의 최대 10개 경로(저장소 루트 기준, 따옴표 없이), _CC_HK_DIRTY_N = 전체 개수. git 실패면 1
 #   상태 폴더는 git 디렉터리 안(작업 트리 밖)이라 나오지 않는다. -z 로 받아 공백·한글 파일명도 그대로 둔다.
+#   스냅샷과 같이 굳힌 설정으로 부른다 (cc_git_safe: core.fsmonitor 등을 실행하지 않음. 2026-10-18 보안 수정 R33)
 _cc_hk_dirty_scan() {
   local top="$1" tmp entry skip=0
   _CC_HK_DIRTY=(); _CC_HK_DIRTY_N=0
   tmp=$(mktemp "${TMPDIR:-/tmp}/cc-status.XXXXXX") || return 1
-  if ! (cd "$top" && git --no-optional-locks status --porcelain -z --untracked-files=all) > "$tmp" 2>/dev/null; then
+  if ! (cd "$top" && cc_git_safe --no-optional-locks status --porcelain -z --untracked-files=all) > "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     return 1
   fi

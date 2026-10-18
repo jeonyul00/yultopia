@@ -27,7 +27,7 @@ test_skill_frontmatter() {
 }
 test_skill_uses_only_existing_subcommands() {
   for sub in $(grep -o 'cc-codex\.sh [a-z-]*' "$SKILL_FILE" | awk '{print $2}' | sort -u); do
-    assert_contains "preflight init path status call wait ack-rejects check-orphan cleanup-stale discard finish put" "$sub"
+    assert_contains "preflight init path status call wait ack-rejects check-orphan cleanup-stale discard finish put release-quarantine" "$sub"
   done
 }
 test_skill_subcommands_exist_in_cli() {
@@ -251,4 +251,42 @@ test_skill_final_recheck_lines_and_stale_notice() {
   assert_contains "$s2" "stale_notice"
   assert_contains "$s2" "\"Codex가 프로젝트 파일을 바꿨습니다\""
   assert_contains "$s2" "7장"
+}
+# ---- 2026-10-18 보안 수정 (R33/R34): git 설정을 바꿔 멈춘 줄, 감시 대상 무시 파일 ----
+test_skill_handles_git_settings_change_without_git_commands() {
+  s7=$(skill_section 7)
+  assert_contains "$s7" "\"Codex가 git 설정을 바꿨습니다\""
+  # 바뀐 설정이 명령을 실행할 수 있으므로 그 저장소에서 git 명령(diff 포함)을 돌리지 않고, 파일은 cat 으로만 보여준다
+  assert_contains "$s7" "git 명령(\`git diff\`·\`git status\` 포함)을 실행하지 않는다"
+  assert_contains "$s7" "\`cat\`"
+  assert_contains "$(skill_section 2)" "\"Codex가 git 설정을 바꿨습니다\""
+  assert_contains "$(skill_section 8)" "\"Codex가 git 설정을 바꿨습니다\""
+  stop=$(awk '/^\*\*Codex 멈추기\*\*/ { on = 1 } on && /^## / { exit } on { print }' "$SKILL_FILE")
+  assert_contains "$stop" "\"Codex가 git 설정을 바꿨습니다\""
+}
+test_skill_explains_watched_ignored_files_and_nested_repos() {
+  s7=$(skill_section 7)
+  assert_contains "$s7" "git이 무시하는 감시 대상"
+  assert_contains "$s7" "git diff 에는 나오지 않는다"
+  assert_contains "$s7" "중첩 git 저장소"
+}
+test_skill_git_settings_refusal_until_restored() {
+  # 바뀐 git 설정이 그대로면 call 이 6 으로 거부한다: 그 줄을 보여주고 되돌리거나 버릴지(discard) 묻는다
+  s7=$(skill_section 7)
+  assert_contains "$s7" "아직 실행 전과 다르면"
+  assert_contains "$s7" "\`cc-codex.sh discard\`"
+}
+test_skill_routes_integrity_unverified_and_git_config_changed_without_git() {
+  # Codex 보안 검수 1차 5·1: git 설정 무결성을 확인하지 못한 줄, preflight 의 git_config_changed 도 git 명령 없이 처리한다
+  s7=$(skill_section 7)
+  assert_contains "$s7" "\"git 설정 무결성을 확인하지 못해\""
+  assert_contains "$(skill_section 2)" "git_config_changed"
+  assert_contains "$(skill_section 8)" "\"git 설정 무결성을 확인하지 못해\""
+}
+test_skill_release_quarantine_only_on_explicit_user_confirmation() {
+  # 격리 기록은 사용자가 git 설정과 비교하지 못한 프로젝트 파일을 직접 확인했다고 분명히 말했을 때만 Claude 가 지운다
+  s7=$(skill_section 7)
+  assert_contains "$s7" "\`cc-codex.sh release-quarantine\`"
+  assert_contains "$s7" "사용자가 git 설정 파일과 Codex 실행 중 바뀐 프로젝트 파일을 직접 확인했다고 분명히 말했을 때만"
+  assert_contains "$s7" "스스로 판단해 실행하지 않는다"
 }

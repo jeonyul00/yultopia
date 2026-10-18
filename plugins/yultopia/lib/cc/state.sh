@@ -1,8 +1,99 @@
 # state.sh - git 디렉터리·active 경로, 안전 검사, state.json 읽기/쓰기. source 전용.
 
+# _cc_repo_discover : git 을 부르지 않고 지금 위치의 저장소를 찾는다 (셸 내장 명령만. Codex 보안 검수 1차 1).
+#   _CC_DISC_TOP = 작업 트리 루트(.git 이 있는 폴더), _CC_DISC_GITDIR = git 디렉터리의 실제 경로 (.git 폴더, 또는 gitfile 이
+#   가리키는 곳). GIT_DIR 이 있으면 그것. 못 찾으면 1. git 의 저장소 찾기와 보통 같은 결과지만 판단은 하지 않는다:
+#   격리 기록(아래 cc_git_dir)을 git 없이 찾는 데만 쓴다.
+_cc_repo_discover() {
+  local d line gp
+  _CC_DISC_TOP=""; _CC_DISC_GITDIR=""
+  if [ -n "${GIT_DIR:-}" ]; then
+    _CC_DISC_GITDIR=$(cd -P "$GIT_DIR" 2>/dev/null && pwd -P) || return 1
+    return 0
+  fi
+  d=$(pwd -P 2>/dev/null) || return 1
+  while :; do
+    if [ -d "$d/.git" ]; then
+      _CC_DISC_GITDIR=$(cd -P "${d%/}/.git" 2>/dev/null && pwd -P) || return 1
+      _CC_DISC_TOP=$d
+      return 0
+    fi
+    if [ -f "$d/.git" ]; then
+      IFS= read -r line < "${d%/}/.git" || [ -n "$line" ] || return 1
+      case "$line" in "gitdir: "?*) gp=${line#gitdir: } ;; *) return 1 ;; esac
+      gp=${gp%"${gp##*[![:space:]]}"}
+      case "$gp" in /*) ;; *) gp="${d%/}/$gp" ;; esac
+      _CC_DISC_GITDIR=$(cd -P "$gp" 2>/dev/null && pwd -P) || return 1
+      _CC_DISC_TOP=$d
+      return 0
+    fi
+    [ "$d" = / ] && return 1
+    d=${d%/*}; [ -n "$d" ] || d=/
+  done
+}
+
+# ---- 외부 격리 기록 (Codex 보안 검수 2차, R36) ----
+# Codex 를 실행할 때마다 그 전에 저장소 밖(Codex sandbox 가 쓸 수 없는 Claude 쪽 상태 폴더)에 기록을 남기고, 확인을 마쳐야 지운다:
+#   ${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/yultopia}/cc/quarantine/<작업 트리 실제 경로(pwd -P)의 sha256>.json
+#   = {v, state: armed|tampered|unverified, repo, call_id, baseline: 실행 전 git 설정 지문|null, changed, updated_at}
+#   .git 이 아니라 작업 트리 경로로 찾으므로 Codex 가 .git 을 옮기거나 gitfile·링크로 바꿔도 남는다. 쓰기·지우기는 call.sh.
+# cc_quarantine_dir : 그 폴더 경로 (만들지 않는다). 정할 수 없으면 1
+cc_quarantine_dir() {
+  local base="${CLAUDE_PLUGIN_DATA:-}"
+  if [ -z "$base" ]; then
+    [ -n "${HOME:-}" ] || return 1
+    base="$HOME/.claude/plugins/data/yultopia"
+  fi
+  printf '%s/cc/quarantine\n' "${base%/}"
+}
+_cc_state_watch_pl() { printf '%s/watch.pl' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"; }
+
+# cc_legacy_running_id <state.json> : 실행 전 트리는 있지만 현재 보안 비교에 필요한 git 설정 지문/무시 파일 manifest/하위 모듈
+# allowlist 중 하나가 없는 옛 running 기록의 호출 번호. 없거나 읽을 수 없으면 빈 출력. git 을 부르지 않는다.
+cc_legacy_running_id() {
+  jq -r 'if (.running | type) == "object" and (.running.pre_tree | type) == "string"
+      and ((.running.pre_gitcfg | type) != "object" or (.running.pre_submodules | type) != "array"
+           or (.running.pre_ignored | type) != "string")
+    then (.running.call_id // "?" | tostring) else empty end' "$1" 2>/dev/null
+}
+
+# _cc_quarantine_find : 지금 위치(pwd -P)와 그 위 폴더들 중 외부 격리 기록이 있는 작업 트리를 찾는다. git 을 부르지 않는다.
+#   0 찾음(_CC_Q_FILE, _CC_Q_ROOT) / 1 없음 / 2 확인할 수 없음 (기록 폴더를 읽을 수 없음 등: 막는 쪽으로 다룬다)
+#   기록 폴더가 없거나 비어 있으면 셸 내장 명령만 쓴다 (훅이 빠르도록. 폴더를 만들지도 않는다)
+_cc_quarantine_find() {
+  local qdir start out r
+  _CC_Q_FILE=""; _CC_Q_ROOT=""
+  qdir=$(cc_quarantine_dir) || return 1
+  [ -e "$qdir" ] || [ -L "$qdir" ] || return 1
+  { [ -d "$qdir" ] && [ -r "$qdir" ] && [ -x "$qdir" ]; } || return 2
+  set -- "$qdir"/*.json
+  [ -e "$1" ] || [ -L "$1" ] || return 1
+  start=$(pwd -P 2>/dev/null) || return 2
+  out=$(perl "$(_cc_state_watch_pl)" qfind "$qdir" "$start"); r=$?
+  case "$r" in 0) ;; 1) return 1 ;; *) return 2 ;; esac
+  _CC_Q_FILE=${out%%$'\n'*}; _CC_Q_ROOT=${out#*$'\n'}
+  [ -n "$_CC_Q_FILE" ] && [ -n "$_CC_Q_ROOT" ] || return 2
+  return 0
+}
+
 # 절대 git 디렉터리. 실패 시 1.
+#   _CC_GITDIR_OVERRIDE 가 있으면 그것 (git 을 부르지 않는다: 격리 중인 cc-codex.sh, 그리고 실행 전에 경로를 정한 감독 프로세스).
+#   외부 격리 기록(위)이 있거나 확인할 수 없으면 git 없이 찾은 경로를 쓴다 (훅 포함. 바뀐 설정으로 git 을 돌리지 않도록:
+#   Codex 보안 검수 1·2차). cc-codex.sh 가 진입 확인을 마쳤으면(_CC_QCHECKED=1) 다시 찾지 않는다. 그 밖에는 git rev-parse.
 cc_git_dir() {
   local d
+  if [ -n "${_CC_GITDIR_OVERRIDE:-}" ]; then
+    printf '%s\n' "$_CC_GITDIR_OVERRIDE"
+    return 0
+  fi
+  if [ "${_CC_QCHECKED:-0}" != 1 ]; then
+    _cc_quarantine_find
+    if [ $? -ne 1 ]; then
+      _cc_repo_discover || return 1
+      printf '%s\n' "$_CC_DISC_GITDIR"
+      return 0
+    fi
+  fi
   d=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 1
   [ -n "$d" ] || return 1
   printf '%s\n' "$d"

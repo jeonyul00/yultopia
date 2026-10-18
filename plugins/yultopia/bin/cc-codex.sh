@@ -135,6 +135,32 @@ cc_cmd_finish() {
 
 cmd="${1:-}"
 [ $# -gt 0 ] && shift
+# 저장소 밖 git 설정 격리 기록 (Codex 보안 검수 1·2차, R36: lib/cc/call.sh cc_quarantine_gate): 무엇보다 먼저, git 을 부르지 않고
+#   지금 위치의 작업 트리(pwd -P 와 그 위)에 기록이 있는지 본다. 기준과 다시 같으면 지우고 그대로 한다. tampered·unverified 이거나
+#   armed 인데 지금 다르면(또는 기록을 읽을 수 없으면) 이 실행은 git 디렉터리를 git 없이 정하고(_CC_GITDIR_OVERRIDE), git 을
+#   돌리는 명령(call·preflight·init·cleanup-stale·_supervise)은 한 줄로 거부한다. 나머지(wait·check-orphan·status·path·put·
+#   ack-rejects·discard·finish·release-quarantine)는 git 없이 동작한다. 막지 않을 때는 이 실행에서 다시 찾지 않는다(_CC_QCHECKED)
+cc_quarantine_gate
+if [ "$_CC_QUARANTINED" = 1 ]; then
+  case "$cmd" in
+    call) cc_line "$(_cc_gitcfg_tamper_line 'Codex를 부르지 않았습니다')"; exit 6 ;;
+    init) cc_line "$(_cc_gitcfg_tamper_line '작업을 시작하지 않았습니다')"; exit 1 ;;
+    preflight)
+      _cc_hk_preflight_emit git_config_changed "$(_cc_gitcfg_tamper_line '/cc 를 시작하거나 이어 하지 않았습니다')" "" "$(_cc_hk_active_json)"
+      exit $? ;;
+    cleanup-stale) cc_line "$(_cc_gitcfg_tamper_line '오래된 /cc 기록 정리도 하지 않았습니다')"; exit 0 ;;
+    _supervise) exit 1 ;;
+    wait|status)
+      # 작업 기록을 찾을 수 없으면(.git 을 바꿔 놓은 경우 등) "작업 없음" 대신 막은 까닭을 알린다
+      if ! cc_active_exists; then
+        cc_line "$(_cc_gitcfg_tamper_line '작업 기록도 찾지 못했습니다')"
+        [ "$cmd" = wait ] && exit 3
+        exit 5
+      fi ;;
+  esac
+else
+  _CC_QCHECKED=1
+fi
 case "$cmd" in
   init)   cc_cmd_init "$@" ;;
   path)   cc_cmd_path "$@" ;;
@@ -148,6 +174,7 @@ case "$cmd" in
   preflight)     cc_cmd_preflight "$@" ;;
   discard)       cc_cmd_discard "$@" ;;
   put)           cc_cmd_put "$@" ;;
+  release-quarantine) cc_cmd_release_quarantine "$@" ;;
   _supervise) cc_cmd_supervise "$@" ;;
   *) cc_line "[cc] 알 수 없는 하위 명령: ${cmd:-(없음)}"; exit 1 ;;
 esac

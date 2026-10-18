@@ -19,6 +19,8 @@ for f in "${FILES[@]}"; do
       *) echo "FAIL $t (임시 폴더 생성 실패)"; failed=$((failed+1)); continue ;;
     esac
     export TMP
+    # 외부 격리 기록(Codex 보안 검수 2차, R36)은 테스트마다 임시 폴더에. 진짜 ~/.claude 는 건드리지 않는다
+    export CLAUDE_PLUGIN_DATA="$TMP/plugin-data"
     ( cd "$TMP" && "$t" ) > "$TMP/.test.out" 2>&1
     rc=$?
     cleanup_test

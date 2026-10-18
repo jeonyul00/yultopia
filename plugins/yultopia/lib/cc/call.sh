@@ -48,6 +48,17 @@
 #     - 그룹이 비었음을 확인하지 못했으면(stop_failed) 그 순간 같아도 안전하다고 보지 않는다: 결과를 반영하지 않고(정상
 #       응답이어도 error) 재시도도 하지 않는다. 그룹이 확실히 사라진 뒤 위와 같이 다시 비교한다 (Codex 리뷰 1차 2).
 #     - 하위 모듈 안의 변경도 잡힌다 (snapshot.sh, Codex 리뷰 1차 1).
+#   2026-10-18 보안 수정 (R33/R34). 실행 뒤 비교는 감독 프로세스(Claude 권한, Codex sandbox 밖)가 git 을 돌리는 일이므로
+#     Codex 가 쓴 파일이 그 git 에게 명령을 실행시키지 못하게 한다:
+#     - 실행 전에 git 설정 지문(cc_gitcfg_record: .git/config, info/attributes·exclude, .git/modules 아래 git 디렉터리와 설정,
+#       include 대상, 작업 트리의 .git 자체)을 뜨고 running.pre_gitcfg 에 남긴다. 실행 뒤에는 어떤 git 명령보다 먼저 git 없이
+#       다시 계산해 비교한다(cc_gitcfg_verify). 다르면 실행 뒤 스냅샷을 뜨지 않고 끝 상태 codex_modified 로 끝낸다
+#       (한 줄: "Codex가 git 설정을 바꿨습니다…" 와 바뀐 파일, last_call.gitcfg_changed, post_tree 없음, 되돌리지 않음).
+#     - 스냅샷은 새로 생긴·등록되지 않은 중첩 저장소 안에서 git 을 실행하지 않고, 모든 git 을 굳힌 설정으로 돈다 (snapshot.sh).
+#     - git 이 무시하는 파일 중 감시 대상(common.sh CC_IGNORED_WATCH_PATTERNS: 비밀·설정 파일, 의존성 폴더)은 내용 manifest
+#       (calls/<n>/ignored.pre, 그 요약값 running.pre_ignored)로 비교한다. 바뀌었으면 작업 트리가 같아도 codex_modified
+#       (메시지에 그 경로, last_call.ignored_changed). manifest 를 만들거나 비교하지 못하면 스냅샷 실패와 같다.
+#     - 끝 상태 없이 끝난 호출을 나중에 다시 비교하는 쪽(wait.sh)도 같은 순서로 같은 확인을 한다.
 
 _CC_CALL_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 CC_SCHEMA_FILE="$_CC_CALL_LIB/pm-output.schema.json"
@@ -563,38 +574,315 @@ _cc_sup_stop_and_note() {
 # _cc_sup_edit_check : 이번 시도의 codex 가 끝나고 그룹을 정리한 뒤 작업 트리를 다시 떠서 실행 전(_CC_SUP_PRE_TREE)과 비교한다.
 #   _CC_SUP_EDIT 이 pending(실행함, 아직 비교 안 함)이나 unknown(앞서 스냅샷 실패: 중단 신호로 git 이 끊긴 경우 등)일 때만
 #   한다 → same | modified | unknown. 이미 정해졌으면(same·modified) 다시 하지 않는다. 아무것도 되돌리거나 지우지 않는다.
+#   2026-10-18 보안 수정: 어떤 git 명령보다 먼저 git 설정 지문을 git 없이 다시 계산해 비교한다 (R33). 바뀌었으면 gitcfg
+#   (_CC_SUP_GITCFG_CHANGED = 바뀐 파일 요약 JSON) 로 정하고 스냅샷을 뜨지 않는다 (격리 기록도 남긴다).
+#   그다음 작업 트리 스냅샷과 감시 대상 무시 파일 manifest 를 비교한다 (R34. _CC_SUP_IGN_CHANGED = 바뀐 경로 요약 JSON).
+#   그룹이 비었음을 확인하지 못했으면(stop_failed) 아무 비교도 하지 않고 deferred (Codex 보안 검수 1차 3). 확인 오류는 unverified.
 _cc_sup_edit_check() {
-  local post
+  local post gc r ign
   case "${_CC_SUP_EDIT:-none}" in pending|unknown) ;; *) return 0 ;; esac
-  post=$(cc_snapshot_tree) || post=""
-  if [ -z "$post" ]; then
-    _CC_SUP_EDIT=unknown; _CC_SUP_POST_TREE=""
-    _cc_sup_log "실행 뒤 작업 트리 스냅샷 실패 → Codex 가 파일을 바꿨는지 확인할 수 없음"
+  _CC_SUP_IGN_CHANGED=""; _CC_SUP_GITCFG_CHANGED=""
+  # 그룹이 비었음을 확인하지 못했으면 남은 프로세스가 지문 확인과 스냅샷 사이에 설정을 바꿀 수 있다 (Codex 보안 검수 1차 3):
+  #   실행 뒤 스냅샷·diff 를 하지 않고 다시 비교를 미룬다. running.pre_* 는 남고, 그룹이 확실히 사라진 것을 확인한 쪽
+  #   (wait·check-orphan·preflight·다음 call)이 git 없는 지문 확인 → 스냅샷 순으로 비교한다 (wait.sh)
+  if [ "${_CC_SUP_STOP_FAILED:-0}" = 1 ]; then
+    _CC_SUP_EDIT=deferred; _CC_SUP_POST_TREE=""
+    _cc_sup_log "그룹이 비었음을 확인하지 못함 → 실행 뒤 스냅샷을 하지 않고 다시 비교를 미룸"
     return 0
   fi
-  _CC_SUP_POST_TREE=$post
-  if [ "$post" = "$_CC_SUP_PRE_TREE" ]; then
+  gc=$(cc_gitcfg_verify "$_CC_SUP_PRE_GITCFG"); r=$?
+  case "$r" in
+    0) ;;
+    1)
+      _CC_SUP_EDIT=gitcfg; _CC_SUP_POST_TREE=""; _CC_SUP_GITCFG_CHANGED=$gc
+      _cc_sup_log "Codex 실행 중에 git 설정이 바뀜 → 실행 뒤 스냅샷(git 명령)을 하지 않음. 되돌리지 않음: $gc"
+      # 되돌리기 전에는 다음 git 명령을 막는다 (저장소 밖 격리 기록. 못 고쳐 써도 실행 전의 armed 기록이 남아 막는다)
+      cc_quarantine_put "$_CC_SUP_ROOT" tampered "$_CC_SUP_PRE_GITCFG" "$gc" "$_CC_SUP_ID" keep \
+        || _cc_sup_log "격리 기록을 tampered 로 쓰지 못함 (armed 기록으로 계속 막음)"
+      return 0 ;;
+    *)
+      _CC_SUP_EDIT=unverified; _CC_SUP_POST_TREE=""
+      _cc_sup_log "git 설정 지문을 다시 계산하지 못함 → 실행 뒤 스냅샷을 하지 않음 (git 설정 무결성 확인 불가)"
+      cc_quarantine_put "$_CC_SUP_ROOT" unverified "$_CC_SUP_PRE_GITCFG" null "$_CC_SUP_ID" keep \
+        || _cc_sup_log "격리 기록을 unverified 로 쓰지 못함 (armed 기록으로 계속 막음)"
+      return 0 ;;
+  esac
+  post=$(cc_snapshot_tree "$_CC_SUP_PRE_SUBS") || post=""
+  ign=""
+  if [ -n "$post" ]; then
+    if cc_ignored_manifest "$_CC_SUP_DIR/ignored.post" "$_CC_SUP_PRE_SUBS" >/dev/null \
+       && ign=$(cc_ignored_diff "$_CC_SUP_DIR/ignored.pre" "$_CC_SUP_PRE_IGN" "$_CC_SUP_DIR/ignored.post"); then
+      :
+    else
+      post=""
+    fi
+    rm -f "$_CC_SUP_DIR/ignored.post"
+  fi
+  if [ -z "$post" ]; then
+    _CC_SUP_EDIT=unknown; _CC_SUP_POST_TREE=""
+    _cc_sup_log "실행 뒤 작업 트리 스냅샷(또는 감시 대상 무시 파일 비교) 실패 → Codex 가 파일을 바꿨는지 확인할 수 없음"
+    return 0
+  fi
+  _CC_SUP_POST_TREE=$post; _CC_SUP_IGN_CHANGED=$ign
+  if [ "$post" = "$_CC_SUP_PRE_TREE" ] && [ -z "$ign" ]; then
     _CC_SUP_EDIT=same
   else
     _CC_SUP_EDIT=modified
-    _cc_sup_log "Codex 실행 중에 작업 트리가 바뀜 ($_CC_SUP_PRE_TREE → $post). 되돌리지 않음"
+    _cc_sup_log "Codex 실행 중에 작업 트리가 바뀜 ($_CC_SUP_PRE_TREE → $post${ign:+, 무시된 감시 대상 $ign}). 되돌리지 않음"
   fi
+  # 종료 확인 + 지문 확인 + 실행 뒤 비교를 마쳤다: 최종 상태를 기록하면 외부 격리 기록을 지울 수 있다 (_cc_sup_finish)
+  _CC_SUP_VERIFIED=1
 }
 
-# _cc_edit_modified_message <pre> <post> : codex_modified 의 한 줄. 바뀐 파일 최대 10개 (git diff --name-only pre post) 와 확인 명령.
-#   경로는 core.quotePath=false 로 한글을 그대로 쓰되, 제어 문자·따옴표가 든 경로는 git 이 한 줄로 따옴표 처리한다.
-#   하위 모듈 안의 변경은 하위 모듈 경로로 나온다 (snapshot.sh). Codex 실행 중에 사용자가 고친 파일도 잡히므로
-#   "Codex 실행 중에 바뀐 파일" 이라고 쓴다. 감독 프로세스와, 끝 상태 없이 끝난 호출을 다시 비교하는 쪽(wait.sh)이 함께 쓴다.
+# _cc_edit_summary_text <{"total","shown"} JSON> : "a, b … (외 N개)" (읽지 못하면 빈 출력)
+_cc_edit_summary_text() {
+  printf '%s' "$1" | jq -r 'select(type == "object" and (.shown | type) == "array")
+      | (.shown | map(tostring | gsub("\\p{Cc}"; "?")) | join(", "))
+        + (if (.total | type) == "number" and .total > (.shown | length) then " … (외 \(.total - (.shown | length))개)" else "" end)' \
+    2>/dev/null
+}
+
+# _cc_edit_modified_message <pre> <post> [ignored_changed JSON] : codex_modified 의 한 줄. 바뀐 파일 최대 10개
+#   (git diff --name-only pre post) 와 확인 명령. 경로는 core.quotePath=false 로 한글을 그대로 쓰되, 제어 문자·따옴표가 든 경로는
+#   git 이 한 줄로 따옴표 처리한다. 하위 모듈 안의 변경은 하위 모듈 경로로, 새 중첩 저장소는 그 경로로 나온다 (snapshot.sh).
+#   Codex 실행 중에 사용자가 고친 파일도 잡히므로 "Codex 실행 중에 바뀐 파일" 이라고 쓴다.
+#   감시 대상 무시 파일(R34)이 바뀌었으면 그 목록(최대 10개)을 따로 붙인다 (git diff 에는 나오지 않는다).
+#   pre 와 post 가 같으면(감시 대상 무시 파일만 바뀜) git diff 를 부르지 않는다. 마지막은 늘 "· 확인: git diff <pre> <post>".
+#   git 은 굳힌 설정으로 부른다 (cc_git_safe, --no-ext-diff --no-textconv). 감독 프로세스와, 끝 상태 없이 끝난 호출을 다시
+#   비교하는 쪽(wait.sh)이 함께 쓴다. 둘 다 git 설정이 그대로인 것을 확인한 뒤에만 부른다.
 _cc_edit_modified_message() {
-  local pre="$1" post="$2" names total shown more=""
-  names=$(git -c core.quotePath=false --no-pager diff --no-ext-diff --no-renames --name-only "$pre" "$post" -- 2>/dev/null \
-          | grep -v '^$')
-  total=$(printf '%s\n' "$names" | grep -c .)
-  shown=$(printf '%s\n' "$names" | grep . | head -n 10 | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')
-  [ "${total:-0}" -gt 10 ] && more=" … (외 $((total - 10))개)"
-  [ -n "$shown" ] || shown="(목록을 읽지 못함)"
-  printf '[cc] Codex가 프로젝트 파일을 바꿨습니다(되돌리지 않음) — Codex 실행 중에 바뀐 파일: %s%s · 확인: git diff %s %s' \
-    "$shown" "$more" "$pre" "$post"
+  local pre="$1" post="$2" ign="${3:-}" names total shown more="" parts="" itext
+  if [ "$pre" != "$post" ]; then
+    names=$(cc_git_safe -c core.quotePath=false --no-pager diff --no-ext-diff --no-textconv --no-renames --name-only \
+              "$pre" "$post" -- 2>/dev/null | grep -v '^$')
+    total=$(printf '%s\n' "$names" | grep -c .)
+    shown=$(printf '%s\n' "$names" | grep . | head -n 10 | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')
+    [ "${total:-0}" -gt 10 ] && more=" … (외 $((total - 10))개)"
+    [ -n "$shown" ] || shown="(목록을 읽지 못함)"
+    parts="Codex 실행 중에 바뀐 파일: $shown$more"
+  fi
+  if [ -n "$ign" ] && [ "$ign" != null ]; then
+    itext=$(_cc_edit_summary_text "$ign")
+    [ -n "$itext" ] || itext="(목록을 읽지 못함)"
+    parts="${parts:+$parts · }git이 무시하는 감시 대상 중 바뀐 파일(git diff 에는 안 나옴): $itext"
+  fi
+  [ -n "$parts" ] || parts="Codex 실행 중에 바뀐 파일: (목록을 읽지 못함)"
+  printf '[cc] Codex가 프로젝트 파일을 바꿨습니다(되돌리지 않음) — %s · 확인: git diff %s %s' "$parts" "$pre" "$post"
+}
+
+# _cc_gitcfg_message <gitcfg_changed JSON> : git 설정이 바뀌어 실행 뒤 비교를 하지 않고 멈출 때의 한 줄 (R33).
+#   SKILL 은 "Codex가 git 설정을 바꿨습니다" 를 보고 그 저장소에서 git 명령을 실행하지 않는다
+_cc_gitcfg_message() {
+  local list
+  list=$(_cc_edit_summary_text "$1")
+  [ -n "$list" ] || list="(목록을 읽지 못함)"
+  printf '[cc] Codex가 git 설정을 바꿨습니다(되돌리지 않음) — 바뀐 설정 파일: %s · 바뀐 설정이 명령을 실행할 수 있어 실행 뒤 작업 트리 비교(git 명령)를 하지 않았고 Codex 결과도 반영하지 않았습니다. 이 저장소에서 git 명령을 쓰기 전에 그 파일을 직접 확인하세요' "$list"
+}
+
+# ---- 외부 격리 기록 (Codex 보안 검수 2차, R36. 위치·형식은 state.sh 의 cc_quarantine_dir) ----
+# 수명:
+#   - 감독 프로세스는 codex 를 실행할 때마다 그 직전에 armed 기록(실행 전 지문, 호출 번호, 작업 트리 경로)을 원자적으로 쓴다
+#     (cc_quarantine_arm). 못 쓰면 codex 를 실행하지 않는다.
+#   - 종료 확인 + 지문 확인 + 실행 뒤 비교 + 최종 상태 기록이 모두 성공해야 지운다 (감독 프로세스 _cc_sup_finish, 또는 그룹이 사라진
+#     뒤 다시 비교한 쪽 wait.sh _cc_wait_settle). git 설정이 바뀌었으면 tampered, 확인할 수 없으면 unverified 로 남는다.
+#   - 모든 cc-codex.sh 진입점은 무엇보다 먼저 git 없이 이 기록을 본다 (cc_quarantine_gate). tampered·unverified 이거나 armed 인데
+#     지금 지문이 다르면 git 설정을 실행할 수 있는 git 명령을 하나도 돌리지 않는다. 기록을 읽거나 쓰지 못하면 막는 쪽(fail closed).
+#   - 저장소 안(.git 아래)의 격리 기록은 쓰지 않는다: Codex 가 .git 을 옮기거나 링크로 바꾸면 그 경로를 믿을 수 없다 (1차의 것은 뺐다).
+cc_quarantine_file() {   # <작업 트리 실제 경로> : 그 기록 파일 경로
+  local qdir key
+  qdir=$(cc_quarantine_dir) || return 1
+  key=$(perl "$(_cc_watch_pl)" qkey "$1" 2>/dev/null) && [ -n "$key" ] || return 1
+  printf '%s/%s.json\n' "$qdir" "$key"
+}
+# cc_quarantine_put <작업 트리 실제 경로> <armed|tampered|unverified> <기준 지문|null> <바뀐 파일 요약|null> <call_id> [keep]
+#   keep = 기록이 이미 있으면 그 기준 지문을 둔다 (tampered·unverified 로 바꿀 때). 원자적(임시 파일 + mv). 링크는 따라가지 않는다:
+#   기록 폴더나 기록 파일이 심볼릭 링크면 쓰지 않는다. 기록 폴더가 작업 트리 안이면(Codex 가 쓸 수 있음) 쓰지 않는다. 0 / 1
+cc_quarantine_put() {
+  local root="$1" st="$2" base="${3:-null}" chg="${4:-null}" id="$5" keep="${6:-}" qdir real f tmp old
+  [ -n "$root" ] || return 1
+  qdir=$(cc_quarantine_dir) || return 1
+  [ -L "$qdir" ] && return 1
+  mkdir -p "$qdir" 2>/dev/null || return 1
+  [ -d "$qdir" ] && [ ! -L "$qdir" ] || return 1
+  real=$(cd -P "$qdir" 2>/dev/null && pwd -P) || return 1
+  case "$real/" in "${root%/}"/*) cc_err "[cc] 격리 기록 폴더가 작업 트리 안에 있어 쓰지 않았습니다: $qdir"; return 1 ;; esac
+  f=$(cc_quarantine_file "$root") || return 1
+  [ -L "$f" ] && return 1
+  if [ -e "$f" ]; then
+    [ -f "$f" ] || return 1
+    if [ "$keep" = keep ]; then
+      old=$(jq -c '.baseline | select(type == "object")' "$f" 2>/dev/null)
+      [ -n "$old" ] && base=$old
+    fi
+  fi
+  tmp=$(mktemp "$qdir/.q.XXXXXX") || return 1
+  if jq -n --arg st "$st" --arg repo "$root" --arg id "$id" --argjson b "$base" --argjson c "$chg" --arg now "$(cc_now_iso)" \
+        '{v: 1, state: $st, repo: $repo, call_id: $id, baseline: $b, changed: $c, updated_at: $now}' > "$tmp" 2>/dev/null \
+     && [ ! -L "$f" ] && mv -f "$tmp" "$f"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+# cc_quarantine_arm <작업 트리 실제 경로> <실행 전 지문> <call_id> : codex 를 띄우기 직전에. 이미 tampered·unverified 이거나 기록을
+#   읽을 수 없으면 1 (codex 를 실행하지 않는다)
+cc_quarantine_arm() {
+  local f st
+  f=$(cc_quarantine_file "$1") || return 1
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    st=$(jq -r '.state // empty' "$f" 2>/dev/null)
+    [ "$st" = armed ] || return 1
+  fi
+  cc_quarantine_put "$1" armed "$2" null "$3"
+}
+# cc_quarantine_release <작업 트리 실제 경로> <지울 상태> [call_id] : 기록이 그 상태(와 호출)일 때만 지운다. 없으면 0. 지우지 못하면 1
+cc_quarantine_release() {
+  local f cur want="$2" id="${3:-}"
+  f=$(cc_quarantine_file "$1") || return 1
+  [ -e "$f" ] || [ -L "$f" ] || return 0
+  [ -L "$f" ] && return 1
+  cur=$(jq -r '"\(.state // "")|\(.call_id // "")"' "$f" 2>/dev/null) || return 1
+  [ "${cur%%|*}" = "$want" ] || return 0               # 다른 쪽이 그 사이 다른 상태로 바꿨다: 그대로 둔다
+  [ -z "$id" ] || [ "${cur#*|}" = "$id" ] || return 0
+  rm -f "$f" && [ ! -e "$f" ]
+}
+# cc_quarantine_eval <작업 트리 실제 경로> [state.json 경로] : 기록을 git 없이 확인한다. "그 호출이 아직 추적 중인가" 는 기록을 읽은
+#   뒤에 state 에서 읽는다 (감독 프로세스는 running 을 쓴 뒤에 arm 하므로, 이 순서면 막 arm 한 호출을 놓치지 않는다).
+#   0 = 막지 않는다: 기록 없음 / 기준과 지금 지문이 같고 같은 호출의 running 기록이 남아 있어, 그 호출의 실행 뒤 비교를
+#       계속할 수 있음. tampered·unverified 는 이때 armed 로 되돌린 뒤 전용 정리 경로가 비교·최종 기록 후 지우게 한다.
+#   1 = 막는다: _CC_GITCFG_TAMPER_UNSURE(1 = 확인할 수 없음), _CC_GITCFG_TAMPER_SUMMARY(바뀐 파일 요약), _CC_GITCFG_QUARANTINE(기록 경로)
+#   지문이 다르면 tampered, 확인하지 못하면 unverified 로 고쳐 쓴다 (못 써도 막는다). 같은 호출의 running 기록이 없으면 지문이
+#   돌아왔어도 실행 뒤 프로젝트 파일 비교를 끝낼 수 없으므로 자동으로 지우지 않고 명시적 release-quarantine 전까지 막는다.
+cc_quarantine_eval() {
+  local root="$1" sf="${2:-}" tracked="" f rec st base rid out r
+  _CC_GITCFG_TAMPER_SUMMARY=""; _CC_GITCFG_TAMPER_UNSURE=0; _CC_GITCFG_QUARANTINE=""
+  f=$(cc_quarantine_file "$root") || { _CC_GITCFG_TAMPER_UNSURE=1; return 1; }
+  [ -e "$f" ] || [ -L "$f" ] || return 0
+  _CC_GITCFG_QUARANTINE=$f
+  rec=""
+  [ -L "$f" ] || rec=$(jq -c 'select(type == "object" and (.state | type) == "string")' "$f" 2>/dev/null)
+  if [ -z "$rec" ]; then _CC_GITCFG_TAMPER_UNSURE=1; return 1; fi
+  st=$(printf '%s' "$rec" | jq -r .state); rid=$(printf '%s' "$rec" | jq -r '.call_id // ""')
+  base=$(printf '%s' "$rec" | jq -c '.baseline | select(type == "object")')
+  _CC_GITCFG_TAMPER_SUMMARY=$(printf '%s' "$rec" | jq -c '.changed | select(type == "object")')
+  case "$st" in armed|tampered|unverified) ;; *) _CC_GITCFG_TAMPER_UNSURE=1; return 1 ;; esac
+  [ -n "$sf" ] && tracked=$(jq -r 'if (.running | type) == "object" then (.running.call_id // empty | tostring) else empty end' \
+                              "$sf" 2>/dev/null)
+  if [ -n "$base" ]; then out=$(cc_gitcfg_verify "$base"); r=$?; else r=2; fi
+  case "$r" in
+    0)
+      if [ -n "$tracked" ] && [ "$tracked" = "$rid" ]; then
+        # 같은 호출의 실행 전 기록이 남아 있으면 그 기록으로 post 비교를 끝낼 수 있다. tampered·unverified 였다면 armed 로
+        # 되돌려, 비교와 최종 상태 기록을 마친 _cc_sup_finish/_cc_wait_settle 만 지우게 한다.
+        if [ "$st" != armed ]; then
+          cc_quarantine_put "$root" armed "$base" null "$rid" keep || {
+            _CC_GITCFG_TAMPER_UNSURE=1
+            return 1
+          }
+        fi
+        return 0
+      fi
+      # active/running 이 없으면 pre_tree·무시 파일 manifest 로 실행 뒤 비교를 끝낼 수 없다. 예전에는 여기서 기록을 지웠고,
+      # Codex 가 git 설정과 함께 바꾼 무시 파일이 남은 채 다음 git 명령이 실행될 수 있었다. 영속 unverified 로 바꾸되,
+      # 쓰기에 실패해도 기존 기록 자체가 남아 있으므로 계속 fail closed 한다.
+      _CC_GITCFG_TAMPER_UNSURE=1
+      [ "$st" = unverified ] || cc_quarantine_put "$root" unverified "$base" \
+        "${_CC_GITCFG_TAMPER_SUMMARY:-null}" "$rid" keep \
+        || cc_err "[cc] 격리 기록을 unverified 로 고쳐 쓰지 못했습니다 (기존 기록으로 그대로 막습니다): $f"
+      return 1 ;;
+    1)
+      _CC_GITCFG_TAMPER_SUMMARY=$out
+      [ "$st" = tampered ] || cc_quarantine_put "$root" tampered null "$out" "$rid" keep \
+        || cc_err "[cc] 격리 기록을 tampered 로 고쳐 쓰지 못했습니다 (그대로 막습니다): $f"
+      return 1 ;;
+    *)
+      _CC_GITCFG_TAMPER_UNSURE=1
+      [ "$st" = unverified ] || cc_quarantine_put "$root" unverified null "${_CC_GITCFG_TAMPER_SUMMARY:-null}" "$rid" keep \
+        || cc_err "[cc] 격리 기록을 unverified 로 고쳐 쓰지 못했습니다 (그대로 막습니다): $f"
+      return 1 ;;
+  esac
+}
+# cc_quarantine_gate : cc-codex.sh 진입점에서 무엇보다 먼저 (git 을 부르지 않는다). 지금 위치의 작업 트리에 외부 기록이 있으면
+#   평가해 _CC_QUARANTINED=1 (막음) 이면 git 디렉터리도 git 없이 정한다 (_CC_GITDIR_OVERRIDE). 기록 폴더를 읽을 수 없으면 막는다
+cc_quarantine_gate() {
+  local r sf="" legacy="" root=""
+  _CC_QUARANTINED=0
+  _cc_quarantine_find; r=$?
+  case "$r" in
+    1)
+      # 외부 기록 쓰기가 앞선 SessionStart 등에서 실패했을 수 있다. 외부 기록이 없다는 이유만으로 Git 을 부르기 전에,
+      # 현재 .git 을 셸로만 찾아 지문 없는 옛 running 이 남았는지 본다. 있으면 외부 unverified 기록을 다시 쓰되,
+      # 이번 쓰기도 실패하더라도 현재 진입은 그대로 막는다. 다음 진입도 같은 검사를 반복하므로 fail closed 이다.
+      if _cc_repo_discover && [ -n "${_CC_DISC_GITDIR:-}" ]; then
+        sf="$_CC_DISC_GITDIR/yultopia-cc/active/state.json"
+        legacy=$(cc_legacy_running_id "$sf")
+        if [ -n "$legacy" ]; then
+          root=${_CC_DISC_TOP:-}
+          if [ -n "$root" ]; then
+            cc_quarantine_put "$root" unverified null null "$legacy" \
+              || cc_err "[cc] 옛 호출의 격리 기록을 남기지 못했습니다 (active 기록으로 그대로 막습니다)"
+            _CC_GITCFG_QUARANTINE=$(cc_quarantine_file "$root" 2>/dev/null)
+          else
+            _CC_GITCFG_QUARANTINE=$(cc_quarantine_dir 2>/dev/null)
+          fi
+          _CC_GITCFG_TAMPER_SUMMARY=""; _CC_GITCFG_TAMPER_UNSURE=1
+          _CC_QUARANTINED=1; _CC_GITDIR_OVERRIDE=$_CC_DISC_GITDIR
+          return 0
+        fi
+      fi
+      return 0 ;;
+    0)
+      _cc_repo_discover && sf="$_CC_DISC_GITDIR/yultopia-cc/active/state.json"
+      cc_quarantine_eval "$_CC_Q_ROOT" "$sf" && return 0 ;;
+    *)
+      _CC_GITCFG_TAMPER_SUMMARY=""; _CC_GITCFG_TAMPER_UNSURE=1; _CC_GITCFG_QUARANTINE=$(cc_quarantine_dir 2>/dev/null) ;;
+  esac
+  _CC_QUARANTINED=1
+  if _cc_repo_discover; then _CC_GITDIR_OVERRIDE=$_CC_DISC_GITDIR; else _CC_GITDIR_OVERRIDE=/nonexistent/yultopia-cc-quarantined; fi
+  return 0
+}
+# cc-codex.sh release-quarantine : 사용자가 git 설정 파일을 직접 확인했다고 말했을 때만 SKILL 이 부른다. 이 작업 트리의 외부 기록을
+#   지운다 (git 을 부르지 않는다). armed(실행 중이거나 비교가 남음)는 지우지 않는다. 한 줄. 0 지움·없음 / 1 실패·거부
+cc_cmd_release_quarantine() {
+  local r st
+  _cc_quarantine_find; r=$?
+  case "$r" in
+    1) cc_line "[cc] 지울 git 설정 격리 기록이 없습니다."; return 0 ;;
+    0) ;;
+    *) cc_line "[cc] git 설정 격리 기록 폴더를 읽지 못해 지우지 않았습니다: $(cc_quarantine_dir 2>/dev/null)"; return 1 ;;
+  esac
+  st=$(jq -r '.state // empty' "$_CC_Q_FILE" 2>/dev/null)
+  if [ "$st" = armed ] && [ ! -L "$_CC_Q_FILE" ]; then
+    cc_line "[cc] Codex 실행이 끝나 비교를 마치기 전의 기록이라 지우지 않았습니다. 먼저 wait 로 결과를 확인하세요."
+    return 1
+  fi
+  if rm -f "$_CC_Q_FILE" && [ ! -e "$_CC_Q_FILE" ] && [ ! -L "$_CC_Q_FILE" ]; then
+    cc_line "[cc] git 설정 격리 기록을 지웠습니다 ($_CC_Q_ROOT). 이제 /cc 가 다시 git 명령을 실행합니다."
+    return 0
+  fi
+  cc_line "[cc] git 설정 격리 기록을 지우지 못했습니다: $_CC_Q_FILE"
+  return 1
+}
+
+# _cc_gitcfg_unverified_note : git 설정 무결성을 확인하지 못해 실행 뒤 비교(git)를 하지 않았을 때 붙이는 말 (Codex 보안 검수 1차 5).
+#   "작업 트리를 확인하지 못해" 와 달리 git diff 를 권하지 않는다. wait.sh 의 _CC_WAIT_UNVERIFIED_MARK 가 이 앞부분을 찾는다
+_cc_gitcfg_unverified_note() {
+  printf 'git 설정 무결성을 확인하지 못해 git 명령을 실행하지 않았습니다(실행 뒤 비교 없음). 이 저장소에서 git 명령을 쓰기 전에 git 설정 파일(.git/config, .git/info, .git/modules 아래 설정)을 직접 확인하세요'
+}
+
+# _cc_gitcfg_tamper_line <하지 않은 일> : cc_quarantine_eval·cc_quarantine_gate 가 막을 때의 한 줄
+#   아직 다름 → "Codex가 git 설정을 바꿨습니다" 로 시작, 확인할 수 없음 → "git 설정 무결성을 확인하지 못해" 를 담는다 (기록 경로 포함).
+#   SKILL 은 두 줄 모두 그 저장소에서 git 명령을 쓰지 않고, 되돌릴지 버릴지 묻는다
+_cc_gitcfg_tamper_line() {
+  local list
+  list=$(_cc_edit_summary_text "$_CC_GITCFG_TAMPER_SUMMARY")
+  if [ "${_CC_GITCFG_TAMPER_UNSURE:-0}" = 1 ]; then
+    printf '[cc] Codex 실행 뒤 git 설정 무결성을 확인하지 못해 남은 기록이거나 프로젝트 파일의 안전 확인을 끝내지 못한 기록이라 git 명령을 실행하지 않았고 %s%s. git 설정 파일(.git/config 등)과 Codex 실행 중 바뀐 프로젝트 파일을 직접 확인하세요. 확인을 마쳤다고 사용자가 말하면 cc-codex.sh release-quarantine 으로 이 기록을 지웁니다 (기록: %s)' \
+      "$1" "${list:+ (기록된 파일: $list)}" "${_CC_GITCFG_QUARANTINE:-?}"
+  else
+    [ -n "$list" ] || list="(목록을 읽지 못함)"
+    printf '[cc] Codex가 git 설정을 바꿨습니다(되돌리지 않음) — 아직 Codex 실행 전과 다른 설정 파일: %s · 바뀐 설정이 명령을 실행할 수 있어 git 명령을 실행하지 않았고 %s. 그 파일을 직접 확인해 원래대로 되돌리거나 작업을 버리세요(discard)' "$list" "$1"
+  fi
 }
 
 # _cc_edit_uncheck_note <pre> : 실행 뒤 스냅샷을 뜨지 못했을 때 메시지에 붙이는 말 (확인할 수 없음. 실행 전 트리와 지금을 비교하는 명령)
@@ -609,14 +897,20 @@ _cc_edit_pending_note() {
   printf '프로젝트 파일 변경은 남은 Codex 프로세스가 끝난 뒤 다시 확인합니다'
 }
 
-# _cc_sup_record_pre <tree> : 이번 시도의 실행 전 트리를 codex 를 띄우기 전에 running.pre_tree 로 남긴다 (Codex 리뷰 1차 3).
-#   감독 프로세스가 기록 없이 죽어도(중단 처리의 유예를 넘겨 KILL 등) wait·check-orphan 이 이것으로 비교한다.
+# _cc_sup_record_pre <tree> <git 설정 지문 JSON> <무시 파일 manifest 요약값> : 이번 시도의 실행 전 상태를 codex 를 띄우기 전에
+#   running.pre_tree / pre_gitcfg / pre_ignored 로 남긴다 (Codex 리뷰 1차 3, 2026-10-18 보안 수정). manifest 자체는
+#   calls/<n>/ignored.pre. 감독 프로세스가 기록 없이 죽어도(중단 처리의 유예를 넘겨 KILL 등) wait·check-orphan 이 이것으로
+#   같은 순서(설정 → 스냅샷 → manifest)로 비교한다.
 #   running 이 아직 이 호출(call_id 와 pgid=$$)이고 stop_failed 가 아닐 때만 쓴다 (잠금 안에서 임시 파일 + mv). 못 쓰면 1
+# <하위 모듈 allowlist JSON> (Codex 보안 검수 1차 2): running.pre_submodules. 실행 뒤 스냅샷·manifest 는 이 목록의 하위 모듈에만 들어간다
 _cc_sup_record_pre() {
   cc_state_update 'if ((.running | type) == "object" and .running.call_id == $id and .running.pgid == $me
                        and .running.stop_failed != true)
-                   then .running.pre_tree = $pre else error("not this call") end' \
-    --argjson id "$_CC_SUP_ID" --argjson me "$$" --arg pre "$1"
+                   then .running.pre_tree = $pre | .running.pre_gitcfg = $gcf | .running.pre_ignored = $ign
+                        | .running.pre_submodules = $subs | .running.pre_root = $root
+                   else error("not this call") end' \
+    --argjson id "$_CC_SUP_ID" --argjson me "$$" --arg pre "$1" --argjson gcf "$2" --arg ign "$3" --argjson subs "$4" \
+    --arg root "${_CC_SUP_ROOT:-}"
 }
 
 # codex 가 끝날 때까지 0.2초 간격으로 확인한다 (bash 가 끝난 자식을 바로 거두므로 kill -0 이 실패하면 끝난 것).
@@ -661,6 +955,7 @@ _cc_sup_run_codex() {
   : "${_CC_SUP_ATTEMPT:=1}"
   _CC_SUP_NO_START=0
   _CC_SUP_EDIT=none; _CC_SUP_PRE_TREE=""; _CC_SUP_POST_TREE=""
+  _CC_SUP_PRE_GITCFG=""; _CC_SUP_PRE_IGN=""; _CC_SUP_IGN_CHANGED=""; _CC_SUP_GITCFG_CHANGED=""; _CC_SUP_PRE_SUBS=""
   argv=()
   while IFS= read -r -d '' x; do argv[${#argv[@]}]="$x"; done < <(cc_codex_argv "$mode" "$session" "$_CC_SUP_DIR")
   if [ "${#argv[@]}" -eq 0 ]; then
@@ -673,20 +968,35 @@ _cc_sup_run_codex() {
   errf=$(_cc_sup_stderr_file "$_CC_SUP_ATTEMPT")
   rm -f "$_CC_SUP_DIR/result.json"
   _CC_SUP_CODEX_IDENT=""; _CC_SUP_CODEX_RECORDED=0
-  # 실행 전 작업 트리 (R32). 뜨지 못하면 Codex 가 파일을 바꾸는지 확인할 수 없으므로 실행하지 않는다 (재실행도 없음)
-  _CC_SUP_PRE_TREE=$(cc_snapshot_tree) || _CC_SUP_PRE_TREE=""
-  if [ -z "$_CC_SUP_PRE_TREE" ]; then
-    _cc_sup_log "실행 전 작업 트리 스냅샷 실패 → codex 를 실행하지 않음"
+  # 실행 전 git 설정 지문 → 작업 트리 (R32) → 감시 대상 무시 파일 manifest (2026-10-18 보안 수정 R33/R34).
+  #   하나라도 뜨지 못하면 Codex 가 파일을 바꾸는지 확인할 수 없으므로 실행하지 않는다 (재실행도 없음)
+  #   하위 모듈은 실행 전에 믿을 수 있는 것(HEAD gitlink + HEAD .gitmodules + 지금 gitfile 이 가리키는 정확한 gitdir)의 allowlist 를
+  #   만들고, 실행 전후 스냅샷·manifest 가 모두 그 목록에만 들어간다 (Codex 보안 검수 1차 2·4)
+  _CC_SUP_PRE_GITCFG=$(cc_gitcfg_record) || _CC_SUP_PRE_GITCFG=""
+  [ -n "$_CC_SUP_PRE_GITCFG" ] && _CC_SUP_PRE_SUBS=$(cc_submodule_allowlist) || _CC_SUP_PRE_SUBS=""
+  [ -n "$_CC_SUP_PRE_SUBS" ] && _CC_SUP_PRE_TREE=$(cc_snapshot_tree "$_CC_SUP_PRE_SUBS") || _CC_SUP_PRE_TREE=""
+  [ -n "$_CC_SUP_PRE_TREE" ] && _CC_SUP_PRE_IGN=$(cc_ignored_manifest "$_CC_SUP_DIR/ignored.pre" "$_CC_SUP_PRE_SUBS") \
+    || _CC_SUP_PRE_IGN=""
+  if [ -z "$_CC_SUP_PRE_GITCFG" ] || [ -z "$_CC_SUP_PRE_SUBS" ] || [ -z "$_CC_SUP_PRE_TREE" ] || [ -z "$_CC_SUP_PRE_IGN" ]; then
+    _cc_sup_log "실행 전 git 설정 지문·하위 모듈 allowlist·작업 트리 스냅샷·무시 파일 manifest 중 하나를 만들지 못함 → codex 를 실행하지 않음"
+    _CC_SUP_PRE_TREE=""
     _CC_SUP_EDIT=nopre; _CC_SUP_NO_START=1; _CC_SUP_ATTEMPT_SECS=0
     return 125
   fi
-  # 실행 전 트리를 codex 를 띄우기 전에 state(running.pre_tree)에 남긴다. 이 감독 프로세스가 기록 없이 죽어도
-  #   wait·check-orphan 이 비교할 수 있도록 (Codex 리뷰 1차 3). 남기지 못하면 실행하지 않는다
-  if ! _cc_sup_record_pre "$_CC_SUP_PRE_TREE"; then
+  # 실행 전 상태를 codex 를 띄우기 전에 state(running.pre_tree·pre_gitcfg·pre_ignored)에 남긴다. 이 감독 프로세스가 기록 없이
+  #   죽어도 wait·check-orphan 이 비교할 수 있도록 (Codex 리뷰 1차 3). 남기지 못하면 실행하지 않는다
+  if ! _cc_sup_record_pre "$_CC_SUP_PRE_TREE" "$_CC_SUP_PRE_GITCFG" "$_CC_SUP_PRE_IGN" "$_CC_SUP_PRE_SUBS"; then
     _cc_sup_log "실행 전 작업 트리를 state 에 기록하지 못함 → codex 를 실행하지 않음"
     _CC_SUP_EDIT=norecord; _CC_SUP_NO_START=1; _CC_SUP_ATTEMPT_SECS=0
     return 125
   fi
+  # 저장소 밖에 armed 격리 기록(실행 전 지문)을 남긴다 (Codex 보안 검수 2차, R36). 못 남기면 실행하지 않는다 (fail closed)
+  if ! cc_quarantine_arm "$_CC_SUP_ROOT" "$_CC_SUP_PRE_GITCFG" "$_CC_SUP_ID"; then
+    _cc_sup_log "외부 격리 기록(armed)을 남기지 못함 → codex 를 실행하지 않음: $(cc_quarantine_dir 2>/dev/null)"
+    _CC_SUP_EDIT=noarm; _CC_SUP_NO_START=1; _CC_SUP_ATTEMPT_SECS=0
+    return 125
+  fi
+  _CC_SUP_ARMED=1; _CC_SUP_VERIFIED=0
   _cc_sup_log "codex 실행 ($mode, 시도 $_CC_SUP_ATTEMPT)"
   t_start=$SECONDS
   _CC_SUP_T0=$t_start        # 시간 상한은 이 시도의 codex 시작부터 (Ruling R16)
@@ -778,6 +1088,9 @@ _cc_sup_write_status() {
 # $keep = 1 (그룹이 비었음을 확인하지 못함, R30): 끝 상태는 똑같이 기록하고 running 은 지우지 않고 stop_failed 로 표시한다.
 #   이미 stop_failed 인 기록(끝 상태가 기록됨)은 다시 바꾸지 않는다.
 # $pre / $post 가 비어 있지 않으면 last_call.pre_tree / post_tree 로 남긴다 (R32: codex_modified, 실행 뒤 확인 불가).
+# $ign / $gcf 가 null 이 아니면 last_call.ignored_changed (바뀐 감시 대상 무시 파일 요약, R34) / gitcfg_changed (바뀐 git
+#   설정 파일 요약, R33) 로 남긴다. $gunv 가 true 면 last_call.gitcfg_unverified (git 설정 무결성을 확인하지 못함, Codex 보안
+#   검수 1차 5). 저장소 밖 격리 기록은 감독 프로세스가 찾은 즉시 따로 쓴다 (_cc_sup_edit_check, cc_quarantine_put).
 #   codex_modified 는 ok 가 아니므로 result 를 반영하지 않고 phase=failed 다.
 # Ruling R27: 마일스톤을 승인·반려하는 것은 review 호출의 결과뿐이다. message 호출(사용자 말·Claude 반대 의견 전달)은
 # diff 를 검수하지 않으므로 그 결과는 "이어가기" 다:
@@ -829,7 +1142,10 @@ if ((.running | type) == "object" and .running.call_id == $id and .running.pgid 
                      verdict: (if $st == "ok" then $r[0].verdict else null end),
                      message: (if $msg == "" then null else $msg end)}
                     + (if $pre != "" then {pre_tree: $pre} else {} end)
-                    + (if $post != "" then {post_tree: $post} else {} end))
+                    + (if $post != "" then {post_tree: $post} else {} end)
+                    + (if $ign != null then {ignored_changed: $ign} else {} end)
+                    + (if $gcf != null then {gitcfg_changed: $gcf} else {} end)
+                    + (if $gunv == true then {gitcfg_unverified: true} else {} end))
     | (if $keep == 1 then .running.stop_failed = true else .running = null end)
   else . end'
 
@@ -892,7 +1208,7 @@ _cc_sup_finish() {
     # 파일 변경 비교를 끝내지 못했다 (codex 를 실행했으면, 이미 바뀐 것을 찾았어도: 남은 프로세스가 더 바꿀 수 있다.
     #   Codex 리뷰 2차): 남은 프로세스가 끝난 뒤 다시 확인한다고 적는다 (그때 최종 목록으로 고쳐진다, wait.sh recheck)
     case "${_CC_SUP_EDIT:-none}" in
-      same|unknown|pending|modified) msg="${msg:-[cc] Codex 호출은 끝났지만 결과를 반영하지 않았습니다} · $(_cc_edit_pending_note)" ;;
+      same|unknown|pending|modified|gitcfg|deferred|unverified) msg="${msg:-[cc] Codex 호출은 끝났지만 결과를 반영하지 않았습니다} · $(_cc_edit_pending_note)" ;;
     esac
     note="일부 Codex 프로세스가 끝났는지 확인하지 못했습니다 (프로세스 그룹 $$. 확인: ps -o pid,command -g $$)"
     if [ -n "$msg" ]; then msg="$msg · $note"; else msg="[cc] Codex 호출은 끝났지만 $note"; fi
@@ -905,9 +1221,14 @@ EOF
   # last_call.pre_tree / post_tree (R32: codex_modified·확인 불가일 때만 값이 있다)
   rarg[${#rarg[@]}]=--arg; rarg[${#rarg[@]}]=pre; rarg[${#rarg[@]}]="${_CC_SUP_LC_PRE:-}"
   rarg[${#rarg[@]}]=--arg; rarg[${#rarg[@]}]=post; rarg[${#rarg[@]}]="${_CC_SUP_LC_POST:-}"
+  # last_call.ignored_changed / gitcfg_changed (R33/R34: 있을 때만)
+  rarg[${#rarg[@]}]=--argjson; rarg[${#rarg[@]}]=ign; rarg[${#rarg[@]}]="${_CC_SUP_LC_IGN:-null}"
+  rarg[${#rarg[@]}]=--argjson; rarg[${#rarg[@]}]=gcf; rarg[${#rarg[@]}]="${_CC_SUP_LC_GITCFG:-null}"
+  if [ "${_CC_SUP_LC_UNVERIFIED:-0}" = 1 ]; then rarg[${#rarg[@]}]=--argjson; rarg[${#rarg[@]}]=gunv; rarg[${#rarg[@]}]=true
+  else rarg[${#rarg[@]}]=--argjson; rarg[${#rarg[@]}]=gunv; rarg[${#rarg[@]}]=false; fi
   _CC_SUP_REC=""
   for i in 1 2 3; do
-    _cc_sup_record_result "$st" "$msg" "$sid" "$ti" "$tc" "$to" "$keep" "${rarg[@]}" && break
+    _cc_sup_record_result "$st" "$msg" "$sid" "$ti" "$tc" "$to" "$keep" "${rarg[@]}" && { _CC_SUP_STATE_OK=1; break; }
     sleep 1
   done
   if [ -z "$_CC_SUP_REC" ]; then
@@ -915,6 +1236,12 @@ EOF
     _CC_SUP_REC=$st
   fi
   _CC_SUP_FINAL=$_CC_SUP_REC
+  # 외부 격리 기록은 종료 확인 + 지문 확인 + 실행 뒤 비교(_CC_SUP_VERIFIED) + 최종 상태 기록이 모두 됐을 때만 지운다.
+  #   그 밖(비교를 미룸·확인 실패·기록 실패·git 설정 변경)에는 남겨 다음 진입점이 막거나 다시 확인한다 (Codex 보안 검수 2차, R36)
+  if [ "${_CC_SUP_ARMED:-0}" = 1 ] && [ "${_CC_SUP_VERIFIED:-0}" = 1 ] && [ "${_CC_SUP_STATE_OK:-0}" = 1 ] \
+     && [ "${_CC_SUP_STOP_FAILED:-0}" = 0 ]; then
+    cc_quarantine_release "$_CC_SUP_ROOT" armed "$_CC_SUP_ID" || _cc_sup_log "외부 격리 기록을 지우지 못함 (다음 진입점이 다시 확인)"
+  fi
   _cc_sup_write_status "$_CC_SUP_FINAL"
   _CC_SUP_DONE=1
   _cc_sup_log "끝: $_CC_SUP_FINAL"
@@ -957,11 +1284,18 @@ _cc_sup_on_exit() {
   #   기록하고 원인과 확인 실패를 함께 적는다 (Codex 리뷰 1차 4). 어느 쪽이든 result 는 반영하지 않는다
   _cc_sup_edit_check
   case "${_CC_SUP_EDIT:-none}" in
+    gitcfg)
+      st=codex_modified; msg=$(_cc_gitcfg_message "$_CC_SUP_GITCFG_CHANGED")
+      _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_GITCFG=$_CC_SUP_GITCFG_CHANGED ;;
     modified)
-      st=codex_modified; msg=$(_cc_edit_modified_message "$_CC_SUP_PRE_TREE" "$_CC_SUP_POST_TREE")
-      _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_POST=$_CC_SUP_POST_TREE ;;
+      st=codex_modified; msg=$(_cc_edit_modified_message "$_CC_SUP_PRE_TREE" "$_CC_SUP_POST_TREE" "$_CC_SUP_IGN_CHANGED")
+      _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_POST=$_CC_SUP_POST_TREE; _CC_SUP_LC_IGN=${_CC_SUP_IGN_CHANGED:-null} ;;
     unknown)
       st=error; msg="$msg · $(_cc_edit_uncheck_note "$_CC_SUP_PRE_TREE")"; _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE ;;
+    unverified)
+      # git 설정 무결성을 확인하지 못했다 (Codex 보안 검수 1차 5): git diff 를 권하지 않는다
+      st=error; msg="$msg · $(_cc_gitcfg_unverified_note)"; _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_UNVERIFIED=1 ;;
+    # deferred (그룹이 비었음을 확인하지 못함): 비교하지 않았다. 끝난 원인 그대로 기록하고 running 을 남긴다 (_cc_sup_finish)
   esac
   _cc_sup_finish "$st" "$msg"
 }
@@ -982,6 +1316,8 @@ _cc_sup_main() {
     _cc_sup_finish error "[cc] 저장소 루트로 이동하지 못해 Codex를 실행하지 않았습니다."
     return 0
   fi
+  # 외부 격리 기록의 열쇠: 작업 트리의 실제 경로 (실행 전에 정한다. .git 을 믿지 않는다: Codex 보안 검수 2차)
+  _CC_SUP_ROOT=$(pwd -P) || _CC_SUP_ROOT=""
   prompt="$_CC_SUP_DIR/prompt.md"
   while :; do
     _cc_sup_run_codex "$mode" "$session" "$prompt"
@@ -994,6 +1330,8 @@ _cc_sup_main() {
           _cc_sup_finish error "[cc] 작업 트리 스냅샷을 만들지 못해 Codex를 실행하지 않았습니다 (Codex가 프로젝트 파일을 바꾸는지 확인할 수 없음)." ;;
         norecord)
           _cc_sup_finish error "[cc] 실행 전 작업 트리를 상태 파일에 기록하지 못해 Codex를 실행하지 않았습니다 (중단돼도 Codex의 파일 수정을 확인할 수 있어야 함)." ;;
+        noarm)
+          _cc_sup_finish error "[cc] 저장소 밖 git 설정 격리 기록($(cc_quarantine_dir 2>/dev/null))을 남기지 못해 Codex를 실행하지 않았습니다." ;;
         *)
           _cc_sup_finish error "[cc] Codex 실행 인자를 만들지 못해 Codex를 실행하지 않았습니다 (세션 ID 형식 확인 필요)." ;;
       esac
@@ -1003,10 +1341,26 @@ _cc_sup_main() {
     #   재시도·형식 재요청 없음, result 반영 없음, 아무것도 되돌리지 않음.
     #   실행 뒤 작업 트리를 뜨지 못했으면 확인할 수 없으므로 result 를 반영하지 않고 error 로 끝낸다.
     case "$_CC_SUP_EDIT" in
+      gitcfg)
+        # git 설정이 바뀌었다 (R33): 실행 뒤 스냅샷을 뜨지 않았다. git 을 부르지 않고 바뀐 파일만 알린다
+        _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_GITCFG=$_CC_SUP_GITCFG_CHANGED
+        _cc_sup_finish codex_modified "$(_cc_gitcfg_message "$_CC_SUP_GITCFG_CHANGED")"; return 0 ;;
       modified)
-        _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_POST=$_CC_SUP_POST_TREE
-        _cc_sup_finish codex_modified "$(_cc_edit_modified_message "$_CC_SUP_PRE_TREE" "$_CC_SUP_POST_TREE")"; return 0 ;;
+        _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_POST=$_CC_SUP_POST_TREE; _CC_SUP_LC_IGN=${_CC_SUP_IGN_CHANGED:-null}
+        _cc_sup_finish codex_modified \
+          "$(_cc_edit_modified_message "$_CC_SUP_PRE_TREE" "$_CC_SUP_POST_TREE" "$_CC_SUP_IGN_CHANGED")"; return 0 ;;
       same) ;;
+      # 그룹이 비었음을 확인하지 못해 비교를 미뤘다 (Codex 보안 검수 1차 3): 아래 stop_failed 처리로 (결과 반영 없음, running 남김)
+      deferred) ;;
+      unverified)
+        # git 설정 무결성을 확인하지 못했다 (Codex 보안 검수 1차 5): 실행 뒤 비교를 하지 않았고 git diff 를 권하지 않는다
+        _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE; _CC_SUP_LC_UNVERIFIED=1
+        if [ "$_CC_SUP_TIMED_OUT" = 1 ]; then
+          _cc_sup_finish error "$(_cc_sup_timeout_message) · $(_cc_gitcfg_unverified_note)"
+        else
+          _cc_sup_finish error "[cc] Codex 결과를 반영하지 않았습니다: $(_cc_gitcfg_unverified_note)"
+        fi
+        return 0 ;;
       *)
         _CC_SUP_LC_PRE=$_CC_SUP_PRE_TREE
         if [ "$_CC_SUP_TIMED_OUT" = 1 ]; then
@@ -1091,9 +1445,14 @@ cc_cmd_supervise() {
   _CC_SUP_CODEX_RECORDED=0; _CC_SUP_ATTEMPT=1; _CC_SUP_ATTEMPT_SECS=0; _CC_SUP_T0=""; _CC_SUP_TIMED_OUT=0; _CC_SUP_REC=""
   _CC_SUP_NO_START=0; _CC_SUP_STOP_FAILED=0
   _CC_SUP_EDIT=none; _CC_SUP_PRE_TREE=""; _CC_SUP_POST_TREE=""; _CC_SUP_LC_PRE=""; _CC_SUP_LC_POST=""
+  _CC_SUP_PRE_GITCFG=""; _CC_SUP_PRE_IGN=""; _CC_SUP_IGN_CHANGED=""; _CC_SUP_GITCFG_CHANGED=""; _CC_SUP_PRE_SUBS=""
+  _CC_SUP_LC_IGN=""; _CC_SUP_LC_GITCFG=""; _CC_SUP_LC_UNVERIFIED=0
+  _CC_SUP_ROOT=""; _CC_SUP_ARMED=0; _CC_SUP_VERIFIED=0; _CC_SUP_STATE_OK=0
   _cc_sup_init_config
   case "$_CC_SUP_ID" in ''|0*|*[!0-9]*) _cc_sup_log "잘못된 호출 번호: ${1:-}"; return 1 ;; esac
   _CC_SUP_ACTIVE=$(cc_active_dir) || { _cc_sup_log "git 저장소를 찾지 못함"; return 1; }
+  # 이 뒤로는 git 디렉터리를 git 없이 쓴다 (실행 전에 정한 경로. Codex 가 바꾼 설정으로 rev-parse 도 돌리지 않도록: Codex 보안 검수 1차 3)
+  _CC_GITDIR_OVERRIDE=${_CC_SUP_ACTIVE%/yultopia-cc/active}
   _CC_SUP_DIR="$_CC_SUP_ACTIVE/calls/$_CC_SUP_ID"
   [ -d "$_CC_SUP_DIR" ] || { _cc_sup_log "호출 폴더 없음: $_CC_SUP_DIR"; return 1; }
   trap '_cc_sup_on_exit' EXIT

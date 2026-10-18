@@ -28,6 +28,7 @@ export CC_CODEX_BIN="${CC_CODEX_BIN:-$CC_TEST_DIR/fake-codex}"
 # 그래서 테스트 안에서 `FAKE_CODEX_SEQ=hang` 처럼 대입만 해도 감독 프로세스와 가짜 codex 에 전달된다.
 # FAKE_CODEX_LOG 는 start_task 가 테스트 폴더 안으로 정한다 (run_cc 도 같은 기본값을 쓴다).
 unset CLAUDE_PROJECT_DIR
+unset CLAUDE_PLUGIN_DATA      # run.sh 가 테스트마다 $TMP/plugin-data 로 정한다 (진짜 ~/.claude 를 쓰지 않도록)
 unset FAKE_CODEX_SEQ FAKE_CODEX_RESULT FAKE_CODEX_DELAY FAKE_CODEX_LOG FAKE_CODEX_LOGIN FAKE_CODEX_LATE_SECS
 export FAKE_CODEX_SEQ FAKE_CODEX_RESULT FAKE_CODEX_DELAY FAKE_CODEX_LOG FAKE_CODEX_LOGIN FAKE_CODEX_LATE_SECS
 
